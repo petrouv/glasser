@@ -1,0 +1,2958 @@
+#!/usr/bin/env bash
+# glasser — writes lens EXIF/XMP/MakerNote tags for manual lenses.
+# Where the "wrong" information in EXIF comes from:
+#   - an electronic (smart) adapter reports a profile to the camera (focal
+#     length + aperture), and the camera records it as a "native" lens;
+#   - a mechanical adapter ring with no electronics — the camera knows
+#     nothing of the lens; EXIF has garbage or the focal length and f-number
+#     for IBIS typed into the "non-CPU lens data" / "Mount adapter" menu;
+#   - a lens profile entered by hand in the camera menu on the native mount
+#     with a chipless lens.
+# The script rewrites everything lens-related in one command with the real
+# data from the database.
+#
+# Usage — print_help (glasser --help); the README repeats it.
+#
+# Lens database — the lenses.ini file next to the script (load_lens_db).
+# Camera database — hardcoded below, function load_camera_db.
+
+set -euo pipefail
+
+GLASSER_VERSION="0.1.0"
+
+# UI language: GLASSER_LANG (en, ru, …), otherwise the locale (LC_ALL,
+# then LC_MESSAGES, then LANG), e.g. ru_RU.UTF-8 → ru. A language without
+# locale/<lang>.sh falls back to English. Read before the UTF-8 fix-up
+# below, which may rewrite LC_ALL.
+UI_LANG="${GLASSER_LANG:-${LC_ALL:-${LC_MESSAGES:-${LANG:-}}}}"
+case "$UI_LANG" in
+    [a-z][a-z]|[a-z][a-z][_.-]*) UI_LANG="${UI_LANG:0:2}" ;;
+    *) UI_LANG=en ;;
+esac
+
+# Table alignment (pad, column widths, name truncation) relies on ${#s},
+# which counts characters only under a UTF-8 LC_CTYPE. Without UTF-8
+# (env -i, ssh without SendEnv, LC_ALL=C) Cyrillic counts as 2 bytes per
+# char and every table falls apart. Then take the first available UTF-8
+# locale. LC_ALL overrides LC_CTYPE, so if it is set, replace it (both
+# candidates use a decimal point, as in C: awk is not affected).
+if [[ $(locale charmap 2>/dev/null) != "UTF-8" ]]; then
+    for _utf8_locale in en_US.UTF-8 C.UTF-8; do
+        if [[ $(LC_ALL=$_utf8_locale locale charmap 2>/dev/null) == "UTF-8" ]]; then
+            if [[ -n "${LC_ALL:-}" ]]; then
+                export LC_ALL=$_utf8_locale
+            else
+                export LC_CTYPE=$_utf8_locale
+            fi
+            break
+        fi
+    done
+    unset _utf8_locale
+fi
+
+# ─── Constants ────────────────────────────────────────────────────────────
+
+# Lens auto-detection tolerances (detect_lens).
+# Focal length: ±0.5 mm — slack for a focal length that the adapter, chip
+# or manual camera-menu entry reports rounded or slightly off.
+# (Nikon MakerNote quantization is irrelevant here: detect reads
+# EXIF:FocalLength, which stays exact.)
+# Aperture: ±0.05 — tie-break between several focal-length candidates.
+DETECT_FOCAL_TOLERANCE_MM=0.5
+DETECT_APERTURE_TOLERANCE=0.05
+
+# ─── Databases ────────────────────────────────────────────────────────────
+# Parallel arrays instead of associative ones, so it works on bash 3.2.
+
+LENS_IDS=()
+LENS_MAKES=()
+LENS_MODELS=()
+LENS_DISPLAYS=()
+LENS_FOCALS=()
+LENS_MAX_APS=()
+LENS_MIN_APS=()
+LENS_SERIALS=()
+LENS_STRINGS=()
+# generation — a short revision/version marker ("M-4", "II", "D", "4th",
+# "white", ...). Used only to tell apart several copies of one model in
+# the selection menu; not written to EXIF.
+LENS_GENERATIONS=()
+
+add_lens() {
+    LENS_IDS+=("$1")
+    LENS_MAKES+=("$2")
+    LENS_MODELS+=("$3")
+    LENS_DISPLAYS+=("$4")
+    LENS_FOCALS+=("$5")
+    LENS_MAX_APS+=("$6")
+    LENS_MIN_APS+=("$7")
+    LENS_SERIALS+=("$8")
+    LENS_STRINGS+=("$9")
+    LENS_GENERATIONS+=("${10}")
+}
+
+# Lens database — lenses.ini next to the script (format described in the
+# file header). Resolve the make install symlink to find the file next to
+# the real script; old macOS has no readlink -f, hence the loop.
+script_dir() {
+    local src="${BASH_SOURCE[0]:-$0}" dir
+    while [[ -L "$src" ]]; do
+        dir=$(CDPATH='' cd -P -- "$(dirname -- "$src")" && pwd)
+        src=$(readlink -- "$src")
+        [[ "$src" == /* ]] || src="$dir/$src"
+    done
+    CDPATH='' cd -P -- "$(dirname -- "$src")" && pwd
+}
+# GLASSER_LENS_DB — another database file (this is how run-tests.sh puts
+# tests/lenses.ini in place of the personal database).
+LENS_DB_FILE="${GLASSER_LENS_DB:-$(script_dir)/lenses.ini}"
+
+# ─── Localization ─────────────────────────────────────────────────────────
+# English strings are the keys. A translation lives in locale/<lang>.sh
+# next to the script: _l10n_<lang> sets T for a key, _plural_<lang> picks
+# a noun form, _help_<lang> prints --help. No catalog file — English.
+# Every key is a literal in single quotes right after _t, _tv, tprintf,
+# errf or dief: run-tests.sh checks that the catalog covers them all.
+if [[ $UI_LANG != en ]]; then
+    _l10n_file="$(script_dir)/locale/$UI_LANG.sh"
+    if [[ -r "$_l10n_file" ]]; then
+        # shellcheck disable=SC1090  # path depends on the language
+        . "$_l10n_file"
+    else
+        UI_LANG=en
+    fi
+    unset _l10n_file
+fi
+
+# Translation of $1 into T (the English text when there is none).
+_t() {
+    T="$1"
+    [[ $UI_LANG == en ]] || "_l10n_$UI_LANG" "$1"
+}
+
+# printf with a translated format: tprintf FORMAT ARGS…
+tprintf() {
+    _t "$1"
+    shift
+    # shellcheck disable=SC2059  # the format is the translated key
+    printf -- "$T" "$@"
+}
+
+# printf -v with a translated format: _tv VAR FORMAT ARGS…
+_tv() {
+    local _tv_var="$1"
+    _t "$2"
+    shift 2
+    # shellcheck disable=SC2059  # the format is the translated key
+    printf -v "$_tv_var" -- "$T" "$@"
+}
+
+# Section keys in add_lens argument order (after id), and which of them
+# are optional. A missing optional key gives an empty value.
+LENS_DB_KEYS=(make model display focal max min serial lens_string generation)
+LENS_DB_OPTIONAL=" serial generation "
+
+# Section → add_lens. $1 — "file:line" of the section header (for errors),
+# $2 — id, $3 — keys seen (" make model … "), then the values in
+# LENS_DB_KEYS order.
+_lens_db_commit() {
+    local where="$1" id="$2" seen="$3" k
+    shift 3
+    for k in "${LENS_DB_KEYS[@]}"; do
+        case "$LENS_DB_OPTIONAL$seen" in
+            *" $k "*) ;;
+            *) dief '%s: section [%s] has no key %s' "$where" "$id" "$k" ;;
+        esac
+    done
+    add_lens "$id" "$@"
+}
+
+load_lens_db() {
+    local file="$LENS_DB_FILE"
+    if [[ ! -f "$file" || ! -r "$file" ]]; then
+        dief 'lens database not found: %s (template: lenses.example.ini next to the script)' "$file"
+    fi
+    local line n=0 key val i idx
+    local id="" id_where="" seen="" ids=" " vals=()
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        n=$((n + 1))
+        line="${line#"${line%%[![:space:]]*}"}"
+        line="${line%"${line##*[![:space:]]}"}"
+        case "$line" in
+            ""|\#*) continue ;;
+            \[*\])
+                [[ -z "$id" ]] || _lens_db_commit "$id_where" "$id" "$seen" "${vals[@]}"
+                id="${line:1:${#line}-2}"
+                id="${id#"${id%%[![:space:]]*}"}"
+                id="${id%"${id##*[![:space:]]}"}"
+                [[ -n "$id" ]] || dief '%s: empty id in []' "$file:$n"
+                # No whitespace: id is the --lens argument, and ids below is a
+                # space-separated list, so "[a b]" would falsely claim "[b]".
+                if [[ "$id" == *[[:space:]]* ]]; then
+                    dief '%s: whitespace in id [%s]' "$file:$n" "$id"
+                fi
+                case "$ids" in
+                    *" $id "*) dief '%s: id [%s] already defined above' "$file:$n" "$id" ;;
+                esac
+                ids+="$id "
+                id_where="$file:$n"
+                seen=" "
+                vals=("" "" "" "" "" "" "" "" "")
+                ;;
+            *=*)
+                [[ -n "$id" ]] || dief '%s: key before the first [id] section' "$file:$n"
+                key="${line%%=*}"
+                key="${key%"${key##*[![:space:]]}"}"
+                val="${line#*=}"
+                val="${val#"${val%%[![:space:]]*}"}"
+                idx=-1
+                for i in "${!LENS_DB_KEYS[@]}"; do
+                    if [[ "${LENS_DB_KEYS[$i]}" == "$key" ]]; then idx=$i; fi
+                done
+                (( idx >= 0 )) || dief '%s: unknown key "%s" in [%s]' "$file:$n" "$key" "$id"
+                case "$seen" in
+                    *" $key "*) dief '%s: key %s repeated in [%s]' "$file:$n" "$key" "$id" ;;
+                esac
+                seen+="$key "
+                vals[idx]="$val"
+                ;;
+            *) dief '%s: expected [id] or "key = value": %s' "$file:$n" "$line" ;;
+        esac
+    done < "$file"
+    [[ -z "$id" ]] || _lens_db_commit "$id_where" "$id" "$seen" "${vals[@]}"
+    (( ${#LENS_IDS[@]} > 0 )) || dief 'lens database has no entries: %s' "$file"
+}
+
+CAM_IDS=()
+CAM_MAKE_PATTERNS=()
+CAM_MODEL_PATTERNS=()
+CAM_DISPLAYS=()
+CAM_CROPS=()
+CAM_MN_GROUPS=()
+CAM_HAS_LENS=()
+
+add_camera() {
+    # Check the MakerNote group at load time: build_exiftool_args and the
+    # preview know only these values; otherwise the plan would promise a
+    # MakerNote that the command would not write.
+    case "$6" in
+        Nikon|FujiFilm|"") ;;
+        *) dief 'add_camera %s: unknown MakerNote group "%s" (expected Nikon|FujiFilm|"")' "$1" "$6" ;;
+    esac
+    CAM_IDS+=("$1")
+    CAM_MAKE_PATTERNS+=("$2")
+    CAM_MODEL_PATTERNS+=("$3")
+    CAM_DISPLAYS+=("$4")
+    CAM_CROPS+=("$5")
+    CAM_MN_GROUPS+=("$6")
+    CAM_HAS_LENS+=("$7")
+}
+
+load_camera_db() {
+    #           id         make_pattern  model_pattern   display          crop   makernote   has_nikon_lens
+    add_camera "nikon-zf"  "^NIKON"      "^NIKON Z f\$"  "Nikon Z f"      "1.0"  "Nikon"     "true"
+    add_camera "fuji-xt4"  "^FUJIFILM"   "^X-T4\$"       "Fujifilm X-T4"  "1.5"  "FujiFilm"  "false"
+    add_camera "fuji-xe5"  "^FUJIFILM"   "^X-E5\$"       "Fujifilm X-E5"  "1.5"  "FujiFilm"  "false"
+    add_camera "fuji-xe3"  "^FUJIFILM"   "^X-E3\$"       "Fujifilm X-E3"  "1.5"  "FujiFilm"  "false"
+}
+
+# ─── Utilities ────────────────────────────────────────────────────────────
+
+err() { tprintf 'error: %s\n' "$*" >&2; }
+die() { err "$*"; exit 1; }
+# err / die with a translated format: errf FORMAT ARGS…
+errf() { local _m; _tv _m "$@"; err "$_m"; }
+dief() { errf "$@"; exit 1; }
+
+# 35mm-equivalent focal length: round(focal × crop). Shared by the preview
+# and build_exiftool_args so that the plan and the write do not diverge.
+equiv_focal() {
+    awk -v f="$1" -v c="$2" 'BEGIN { printf "%d", (f*c)+0.5 }'
+}
+
+# Whether a separate Nikon:Lens is written for the camera at index $1. One
+# rule for the preview and build_exiftool_args.
+mn_writes_nikon_lens() {
+    [[ "${CAM_MN_GROUPS[$1]}" == "Nikon" && "${CAM_HAS_LENS[$1]}" == "true" ]]
+}
+
+# Noun form for a count: _plural N ONE MANY (English forms); another
+# language maps them in _plural_<lang>.
+_plural() {
+    if [[ $UI_LANG != en ]]; then
+        "_plural_$UI_LANG" "$@"
+    elif [[ $1 -eq 1 ]]; then
+        printf '%s' "$2"
+    else
+        printf '%s' "$3"
+    fi
+}
+
+files_word()  { _plural "$1" file files; }
+groups_word() { _plural "$1" group groups; }
+
+# Length of the longest argument, in characters → MAX_LEN.
+_max_len() {
+    local v
+    MAX_LEN=0
+    for v in "$@"; do
+        if (( ${#v} > MAX_LEN )); then MAX_LEN=${#v}; fi
+    done
+}
+
+# Prints a string right-padded with spaces to the visual width w.
+# Does not use `printf %-Ns` directly: it counts bytes, and UTF-8 Russian
+# characters (2 bytes each) break the alignment. ${#s} in bash 3.2 counts
+# characters — but only under a UTF-8 LC_CTYPE (set by the block at the
+# top of the script). Wide characters (CJK, 2 terminal columns) count as
+# 1 — a known limitation, affects only Make/Model from EXIF.
+pad() {
+    local s="$1" w="$2"
+    local n=$((w - ${#s}))
+    if (( n > 0 )); then
+        printf '%s%*s' "$s" "$n" ''
+    else
+        printf '%s' "$s"
+    fi
+}
+
+# ─── Card mode ──────────────────────────────────────────────────────────
+#
+# Each group is a "card": a one-line anchor header + dynamic part below
+# (Camera/Lens + prompt, or the correction menu). When the dynamic part
+# changes, everything below the header is erased and redrawn; the header
+# stays. The pop phase (yes/skip) collapses it all into one line.
+#
+# "Saved points" (scan_top, card_top) are cursor rows obtained via CSI 6n
+# (\033[6n → the terminal replies \033[<row>;<col>R). Going back is done
+# with a relative \033[<N>A (cursor up N) + ED.
+#
+# Why not DECSC/DECRC: they store ONE position (VT100 standard,
+# kovidgoyal/kitty#1264), nested saves are impossible.
+#
+# Why cursor up works only after the "soft clear" at the start of main:
+# cursor up physically cannot move the cursor above the top of the visible
+# area (VT standard). If the content had already scrolled when the script
+# started (e.g. a long bash history above), the saved position moves out
+# of the visible area and cursor up "hits" the top visible line.
+#
+# Why a card "makes room" in advance (_card_make_room): the row from
+# CSI 6n is an absolute screen line. If an episode (the lens menu — dozens
+# of lines) does not fit below the anchor, the screen scrolls and the
+# anchor no longer points at the header. Therefore:
+#   - a new card scrolls the screen to fit before taking the anchor
+#     (newlines + cursor up) — so the scroll happens BEFORE the anchor;
+#   - an episode inside a card that would scroll the screen sets
+#     CARD_OVERFLOW, and the next redraw does a soft clear and reprints
+#     the banner, the collapsed groups and the header (the menu stays in
+#     scroll-back). No scrolling in advance: it would push the banner and
+#     the collapsed lines of previous groups off the screen.
+#
+# Why erasing does not start with ED at home (line 1, column 1) and
+# redraw does not use ED 2: tmux (scroll-on-clear, on by default) treats
+# ED from home and ED 2 as clearing the screen and first dumps what is
+# visible into scroll-back — copies of cards and the "Scanning: " line
+# stayed there, though everything on screen was erased. And an anchor on
+# line 1 is common: after _card_make_room and a soft clear. So line 1 is
+# erased with EL, the rest with ED from line 2 (_restore_and_erase,
+# ANSI_WIPE_SCREEN). The soft clear at the start of main stays ED 2:
+# there, dumping earlier shell output into scroll-back is wanted.
+#
+# Active only in a TTY with a normal TERM (not dumb). If the terminal did
+# not answer CSI 6n (main tries once), it is turned off too and output is
+# linear. In non-TTY it is a no-op (tests, cron).
+USE_CARDS=0
+[[ -t 1 && -n "${TERM:-}" && "${TERM:-}" != "dumb" ]] && USE_CARDS=1
+
+# Context for redrawing the header. Used by card_reset_to_header.
+CARD_G=""
+CARD_TG=""
+CARD_TOP_ROW=0
+# 1 — the last episode did not fit on screen, anchor CARD_TOP_ROW is stale.
+CARD_OVERFLOW=0
+# For redrawing the screen after an overflow: the banner (as printed in
+# main) and the collapsed lines of groups already done.
+GLASSER_BANNER=""
+COLLAPSED_LINES=()
+# Height of the "summary + Accept?" episode: blank + 2 summary lines +
+# 7 prompt_confirm lines, +2 slack (summary wrap, invalid input).
+SUMMARY_EPISODE_ROWS=12
+# Terminal size, filled by _term_size (0 — unknown).
+TERM_ROWS=0
+TERM_COLS=0
+# Result of get_cursor_row (0 — position unknown).
+CURSOR_ROW=0
+# Card styling (_card_style_init): 1 — card mode without --no-art.
+# Header with ◉ and group dots, a rule, a summary with check marks, the
+# "Accept?" keys on one line, left indent CARD_IND. CS_* are colors
+# (empty under NO_COLOR and without styling).
+CARD_STYLE=0
+CARD_IND=""
+CS_B="" CS_D="" CS_R="" CS_RED="" CS_OK="" CS_WARN="" CS_KEY=""
+
+ANSI_ERASE_DOWN=$'\033[J'    # ED 0: erase from cursor to end of screen.
+ANSI_ERASE_LINE=$'\033[2K\r' # EL 2 + CR: erase the whole line, go to start.
+ANSI_CLEAR_SCREEN=$'\033[H\033[2J'  # home + ED 2: home + erase visible area.
+# Same without ED at home (see "does not start with ED at home" above):
+# home, EL on line 1, ED from line 2, home again.
+ANSI_WIPE_SCREEN=$'\033[H\033[K\033[B\033[J\033[H'
+# ED 0 from the cursor on line 1 without ED at home: EL to end of line,
+# ED from line 2 (DECSC/DECRC put the cursor back).
+ANSI_ERASE_DOWN_ROW1=$'\0337\033[K\033[B\r\033[J\0338'
+ANSI_CPR_QUERY=$'\033[6n'    # Cursor Position Report: reply is row;col.
+
+PROGRESS_BAR_WIDTH=40  # bar width in cells (shrinks in a narrow window)
+
+# Tmp file to which run_with_progress_bar appends the paths of files
+# with warnings from the pipe subshell (the parent shell does not see
+# variable changes made in a subshell). execute_plan creates/removes the
+# file and calls print_warning_postmortem after the run.
+WARNED_FILES_TMP=""
+# Argfile with the current group's paths (exiftool -@). Global so that
+# the trap removes it on die / Ctrl-C in the middle of a run.
+ARGFILE=""
+
+# EXIT trap (set by execute_plan): removes tmp files both on die and on
+# Ctrl-C (bash runs the EXIT trap even when killed by SIGINT; the exit
+# code/signal is preserved). $(...) and pipe subshells do not inherit it.
+_cleanup_tmp() {
+    if [[ -n "$WARNED_FILES_TMP" ]]; then rm -f "$WARNED_FILES_TMP"; fi
+    if [[ -n "$ARGFILE" ]]; then rm -f "$ARGFILE"; fi
+    return 0
+}
+
+# Current cursor row via CSI 6n — into the global CURSOR_ROW (0 —
+# position unknown). Subtleties:
+#   1. The "\033[6n" query goes DIRECTLY to /dev/tty (not through
+#      `read -p`, whose prompt goes to stderr and is easily swallowed
+#      by a redirect).
+#   2. The terminal replies on stdin with "ESC [ <row> ; <col> R". In
+#      canonical mode the terminal echoes the reply and does not hand it
+#      to read until Enter — `stty -echo -icanon` is needed while reading.
+#   3. Timeout — only `read -t 1`: bash 3.2 does not understand fractional
+#      -t (fails with invalid timeout specification). stty min/time do not
+#      help: `read -d` itself switches the tty to min=1 time=0, and the
+#      VTIME timer starts only after the first byte — with no reply read
+#      would hang forever. No reply within 1 s gives 0 (callers treat 0
+#      as "position unknown"). A late reply stays in the tty input
+#      queue — so main tries CPR once and on 0 turns cards off
+#      entirely.
+#   4. Ctrl-C during the read (silent terminal — a whole second): the read
+#      runs in $(...), its subshell dies from SIGINT without restoring the
+#      tty, and a parent without a trap dies at once without waiting for
+#      the subshell — the tty is left without echo. So the parent's INT
+#      trap restores the tty: bash with a trap first waits for the
+#      subshell, then runs the trap; the trap is removed and SIGINT is
+#      re-raised — glasser dies from SIGINT just as without a trap (code
+#      130 in the calling shell). Called only before execute_plan, which
+#      has no INT trap of its own yet, so after the read just `trap - INT`.
+get_cursor_row() {
+    local savedtty
+    CURSOR_ROW=0
+    savedtty=$(stty -g </dev/tty 2>/dev/null) || return 0
+    # shellcheck disable=SC2064  # savedtty and $$ are expanded now
+    trap "stty '$savedtty' </dev/tty 2>/dev/null; trap - INT; kill -INT $$" INT
+    CURSOR_ROW=$(_read_cursor_row "$savedtty")
+    trap - INT
+}
+
+# Body of get_cursor_row (runs in $(...)): prints the row or 0. $1 — stty -g
+# before the read.
+_read_cursor_row() {
+    local savedtty="$1" row="" _discard_prefix _discard_col
+    stty -echo -icanon </dev/tty 2>/dev/null || { printf '0'; return; }
+    printf '%s' "$ANSI_CPR_QUERY" >/dev/tty
+    # shellcheck disable=SC2034
+    IFS='[;' read -t 1 -srd R \
+        _discard_prefix row _discard_col </dev/tty || row=0
+    stty "$savedtty" </dev/tty 2>/dev/null
+    # On timeout a fragment of the reply may be left in row.
+    [[ "$row" =~ ^[0-9]+$ ]] || row=0
+    printf '%d' "$row"
+}
+
+# Fills TERM_ROWS/TERM_COLS from `stty size` (0 — unknown: no tty or
+# the terminal does not report its size). Called on every use — the
+# window may have been resized.
+_term_size() {
+    TERM_ROWS=0
+    TERM_COLS=0
+    local s
+    s=$(stty size </dev/tty 2>/dev/null) || s=""
+    if [[ "$s" =~ ^([0-9]+)\ ([0-9]+)$ ]]; then
+        TERM_ROWS=${BASH_REMATCH[1]}
+        TERM_COLS=${BASH_REMATCH[2]}
+    fi
+}
+
+# How many screen lines a string of $1 characters takes at width TERM_COLS
+# (wrapping at the edge). Unknown width — 1. Result in ROWS_FOR.
+_rows_for() {
+    local len="$1"
+    ROWS_FOR=1
+    if (( TERM_COLS > 0 && len > TERM_COLS )); then
+        ROWS_FOR=$(( (len + TERM_COLS - 1) / TERM_COLS ))
+    fi
+}
+
+# Makes room for an episode $1 lines high (from the current cursor position
+# to the prompt line inclusive). See "makes room" above.
+#   - fits below the cursor — nothing;
+#   - the anchor already exists (CARD_TOP_ROW > 0) — CARD_OVERFLOW=1 (redraws
+#     card_reset_to_header / card_collapse);
+#   - no anchor yet — scrolls the screen for the episode, at most one screen.
+_card_make_room() {
+    local need="$1" cur k nl
+    [[ $USE_CARDS -eq 1 ]] || return 0
+    _term_size
+    get_cursor_row
+    cur=$CURSOR_ROW
+    if (( TERM_ROWS <= 0 || cur <= 0 )); then return 0; fi
+    k=$((need - 1))
+    if (( cur + k <= TERM_ROWS )); then return 0; fi
+    if (( CARD_TOP_ROW > 0 )); then
+        CARD_OVERFLOW=1
+        return 0
+    fi
+    if (( k > TERM_ROWS - 1 )); then k=$((TERM_ROWS - 1)); fi
+    if (( k <= 0 )); then return 0; fi
+    printf -v nl '%*s' "$k" ''
+    nl=${nl// /$'\n'}
+    printf '%s\033[%dA' "$nl" "$k"
+}
+
+# Soft clear after an overflow: the banner and collapsed groups again
+# (the tail, at most half the screen), a new anchor CARD_TOP_ROW.
+_card_redraw_screen() {
+    local i start n=${#COLLAPSED_LINES[@]} max
+    _term_size
+    printf '%s' "$ANSI_WIPE_SCREEN"
+    printf '%s' "$GLASSER_BANNER"
+    max=$((TERM_ROWS / 2 - BANNER_ROWS))
+    if (( max < 0 )); then max=0; fi
+    start=0
+    if (( n > max )); then start=$((n - max)); fi
+    for ((i=start; i<n; i++)); do
+        printf '%s\n' "${COLLAPSED_LINES[$i]}"
+    done
+    CARD_OVERFLOW=0
+    get_cursor_row
+    CARD_TOP_ROW=$CURSOR_ROW
+}
+
+# Moves the cursor back to row $1, erases to the end of the screen (on line
+# 1 without ED at home). If current row < target, does nothing.
+_restore_and_erase() {
+    local target_row="$1"
+    local current_row erase="$ANSI_ERASE_DOWN"
+    get_cursor_row
+    current_row=$CURSOR_ROW
+    local lines_up=$((current_row - target_row))
+    (( target_row == 1 )) && erase="$ANSI_ERASE_DOWN_ROW1"
+    if (( lines_up > 0 )); then
+        printf '\033[%dA%s' "$lines_up" "$erase"
+    elif (( lines_up == 0 )); then
+        printf '%s' "$erase"
+    fi
+}
+
+# Height of the group header (see _print_group_header) in screen lines.
+# Result in HEADER_ROWS. TERM_COLS must be fresh.
+_group_header_rows() {
+    local exif
+    exif=$(_format_exif_basis "$CARD_G")
+    if [[ $CARD_STYLE -eq 1 ]]; then
+        _card_rule_width
+        _exif_wrap "$exif" "$CARD_RULE_W"
+        HEADER_ROWS=$((${#EXIF_LINES[@]} + 1))  # + rule
+    else
+        _rows_for $((7 + ${#exif}))    # "EXIF:  " + value
+        HEADER_ROWS=$ROWS_FOR
+    fi
+    if [[ $CARD_TG -gt 1 ]]; then
+        HEADER_ROWS=$((HEADER_ROWS + 2))   # blank + "[Group N/M] …"
+    fi
+}
+
+# Turns on card styling (CARD_STYLE, CS_* colors). Call after it has
+# been decided whether card mode is on (USE_CARDS).
+_card_style_init() {
+    CARD_STYLE=0
+    CARD_IND=""
+    [[ $USE_CARDS -eq 1 && "$NO_ART" != 1 ]] || return 0
+    CARD_STYLE=1
+    CARD_IND="  "
+    [[ -z "${NO_COLOR:-}" ]] || return 0
+    CS_B=$'\033[1m'; CS_D=$'\033[2m'; CS_R=$'\033[0m'
+    CS_RED=$'\033[38;5;160m'; CS_OK=$'\033[38;5;65m'
+    CS_WARN=$'\033[38;5;136m'; CS_KEY=$'\033[1;38;5;166m'
+}
+
+# Right edge of the card: up to 80 columns, one column less than the
+# screen (full width gives an extra wrap on some terminals). The rule runs
+# from the CARD_IND indent to the edge. → CARD_RULE_W (edge, indent included).
+_card_rule_width() {
+    _term_size
+    CARD_RULE_W=80
+    (( TERM_COLS > 0 && TERM_COLS - 1 < CARD_RULE_W )) && CARD_RULE_W=$((TERM_COLS - 1))
+    (( CARD_RULE_W < 20 )) && CARD_RULE_W=20
+}
+
+# The EXIF line of the CARD_STYLE header, split by fields ("  ·  ") into
+# lines no wider than $2: the first is "    EXIF    field · field", the
+# next ones are indented by 12. A field longer than a line stays whole
+# (the terminal wraps it — _rows_for). Result in EXIF_LINES; no color.
+_exif_wrap() {
+    local rest="$1" w="$2" line="    EXIF    " part n=0 sep="  ·  "
+    EXIF_LINES=()
+    while [[ -n "$rest" ]]; do
+        if [[ "$rest" == *"$sep"* ]]; then
+            part="${rest%%"$sep"*}"; rest="${rest#*"$sep"}"
+        else
+            part="$rest"; rest=""
+        fi
+        if (( n > 0 && ${#line} + 3 + ${#part} > w )); then
+            EXIF_LINES+=("$line")
+            line="            $part"
+        elif (( n > 0 )); then
+            line+=" · $part"
+        else
+            line+="$part"
+        fi
+        n=$((n + 1))
+    done
+    EXIF_LINES+=("$line")
+}
+
+# Group header in CARD_STYLE: "◉ Group N of M · K files", a rule, a faint
+# EXIF line (_exif_wrap). All indented by CARD_IND.
+_print_group_header_styled() {
+    local g="$1" total_groups="$2" exif="$3" w rule="" i
+    _card_rule_width
+    w=$CARD_RULE_W
+    for ((i = ${#CARD_IND}; i < w; i++)); do rule+="─"; done
+    if [[ $total_groups -gt 1 ]]; then
+        local count="${GROUP_COUNT[$g]}" word
+        word=$(files_word "$count")
+        tprintf '\n%s%s◉%s %sGroup %d%s %sof %d · %d %s%s\n' \
+               "$CARD_IND" "$CS_RED" "$CS_R" "$CS_B" $((g+1)) "$CS_R" "$CS_D" \
+               "$total_groups" "$count" "$word" "$CS_R"
+    fi
+    printf '%s%s%s%s\n' "$CARD_IND" "$CS_D" "$rule" "$CS_R"
+    _exif_wrap "$exif" "$w"
+    for i in "${EXIF_LINES[@]}"; do
+        printf '%s%s%s\n' "$CS_D" "$i" "$CS_R"
+    done
+}
+
+# Saves the position BEFORE the header into the global CARD_TOP_ROW and
+# prints the header. $3 — height of the first episode under the header
+# (default: summary + "Accept?"): room for header and episode is made first.
+card_start_with_group_header() {
+    CARD_G="$1"
+    CARD_TG="$2"
+    local need="${3:-$SUMMARY_EPISODE_ROWS}"
+    if [[ $USE_CARDS -eq 1 ]]; then
+        CARD_OVERFLOW=0
+        CARD_TOP_ROW=0
+        _term_size
+        _group_header_rows
+        need=$((need + HEADER_ROWS))
+        _card_make_room "$need"
+        get_cursor_row
+        CARD_TOP_ROW=$CURSOR_ROW
+        if (( TERM_ROWS > 0 && need > TERM_ROWS )); then
+            CARD_OVERFLOW=1
+        fi
+    fi
+    _print_group_header
+}
+
+# Erases everything from the top of the card and reprints the header. Used
+# between sub-episodes (prompt → menu → new prompt). $1 — height of the
+# next episode: room for it is made in advance.
+card_reset_to_header() {
+    local need="${1:-0}"
+    if [[ $USE_CARDS -eq 1 && $CARD_TOP_ROW -gt 0 ]]; then
+        if [[ $CARD_OVERFLOW -eq 1 ]]; then
+            _card_redraw_screen
+        else
+            _restore_and_erase "$CARD_TOP_ROW"
+        fi
+        _print_group_header
+        if [[ $need -gt 0 ]]; then
+            _card_make_room "$need"
+        fi
+    fi
+}
+
+# Moves the cursor back to the top of the card, erases everything, prints
+# the collapsed summary. In non-TTY it just prints the summary.
+card_collapse() {
+    if [[ $USE_CARDS -eq 1 && $CARD_TOP_ROW -gt 0 ]]; then
+        if [[ $CARD_OVERFLOW -eq 1 ]]; then
+            _card_redraw_screen
+        else
+            _restore_and_erase "$CARD_TOP_ROW"
+        fi
+    fi
+    printf '%s%s\n' "$CARD_IND" "$1"
+    if [[ $USE_CARDS -eq 1 ]]; then
+        COLLAPSED_LINES+=("$CARD_IND$1")
+    fi
+}
+
+# Rounds a raw numeric EXIF value (e.g. 1.89999999136559) to two decimals
+# and trims trailing zeros ("1.9"). Empty input — empty output. Needed
+# only for UI output — in GROUP_SIG values stay raw, otherwise group
+# matching and detect_lens would break.
+_round_exif() {
+    local v="$1"
+    [[ -z "$v" ]] && return 0
+    LC_NUMERIC=C awk -v v="$v" 'BEGIN {
+        s = sprintf("%.2f", v + 0)
+        sub(/0+$/, "", s)
+        sub(/\.$/, "", s)
+        print s
+    }'
+}
+
+# Formats one "EXIF: …" line — the raw group signature (what is actually
+# read from Make/Model/LensModel/FocalLength/MaxApertureValue).
+# This is the user's primary context when confirming the guess:
+# "this is what was in EXIF — this is what I guessed".
+#
+# Fields carry explicit labels ("LensModel=...", "FocalLength=..."),
+# because without them a piece like "35mm f/2G, 35mm" is ambiguous:
+# the first "35mm" is part of the textual LensModel, the second is the
+# separate numeric FocalLength tag that detect_lens actually works on.
+_format_exif_basis() {
+    local g="$1"
+    local sig_make sig_model sig_lensmodel sig_focal sig_maxap
+    IFS=$SEP read -r sig_make sig_model sig_lensmodel sig_focal sig_maxap \
+        <<<"${GROUP_SIG[$g]}"
+    local focal_str maxap_str
+    focal_str=$(_round_exif "$sig_focal")
+    maxap_str=$(_round_exif "$sig_maxap")
+
+    local parts=()
+    parts+=("Make/Model=\"${sig_make:-?} ${sig_model:-?}\"")
+    [[ -n "$sig_lensmodel" ]] && parts+=("LensModel=\"$sig_lensmodel\"")
+    [[ -n "$focal_str" ]]     && parts+=("FocalLength=${focal_str}mm")
+    [[ -n "$maxap_str" ]]     && parts+=("MaxAperture=f/${maxap_str}")
+    if [[ ${#parts[@]} -eq 1 ]]; then _t '(no lens EXIF)'; parts+=("$T"); fi
+
+    local out="" p
+    for p in "${parts[@]}"; do
+        if [[ -z "$out" ]]; then out="$p"; else out="${out}  ·  ${p}"; fi
+    done
+    printf '%s' "$out"
+}
+
+# Prints the group's anchor header. Called from card_start_with_group_header
+# and card_reset_to_header. Context (CARD_G, CARD_TG) is set earlier.
+#   - multi-group: "[Group N/M]  K files" + "EXIF: …".
+#   - single-group: only "EXIF: …" (the group is identified by the banner).
+# The EXIF line is the basis for confirming the guess: the user must see
+# what the choice was based on, especially when there are many groups
+# and they are not in chronological order. Camera/Lens (as guessed/chosen)
+# are printed by print_summary below.
+_print_group_header() {
+    local g="$CARD_G" total_groups="$CARD_TG"
+    local exif
+    exif=$(_format_exif_basis "$g")
+    if [[ $CARD_STYLE -eq 1 ]]; then
+        _print_group_header_styled "$g" "$total_groups" "$exif"
+        return 0
+    fi
+    if [[ $total_groups -gt 1 ]]; then
+        local count="${GROUP_COUNT[$g]}"
+        local word
+        word=$(files_word "$count")
+        tprintf '\n[Group %d/%d]  %d %s\n' \
+               $((g+1)) "$total_groups" "$count" "$word"
+    fi
+    printf 'EXIF:  %s\n' "$exif"
+}
+
+# Case-insensitive substring search. Returns 0/1.
+contains_ci() {
+    local haystack="$1" needle="$2" rc
+    shopt -s nocasematch
+    [[ "$haystack" == *"$needle"* ]]
+    rc=$?
+    shopt -u nocasematch
+    return $rc
+}
+
+# Shell-quotes a value for printing in dry-run.
+shquote() {
+    local s="$1"
+    # Simple "safe" values — without quotes.
+    if [[ "$s" =~ ^[A-Za-z0-9_./=:+@,-]+$ ]]; then
+        printf '%s' "$s"
+        return
+    fi
+    case "$s" in
+        *\'*)
+            local esc
+            esc=$(awk -v q="'" '{ gsub(q, q "\\" q q); print }' <<<"$s")
+            printf "'%s'" "$esc"
+            ;;
+        *)
+            printf "'%s'" "$s"
+            ;;
+    esac
+}
+
+# ─── Scanning and grouping ──────────────────────────────────────────────
+#
+# scan_and_group reads all images in the folder with one batch exiftool
+# command, classifies them by signature (Make+Model+LensModel+Focal+
+# MaxAperture) and fills the global parallel arrays:
+#   FILES_PATH[i]       — path of the i-th file (in scan order, groups
+#                         interleaved; the group is in FILES_GROUP);
+#   FILES_GROUP[i]      — group index of the i-th file;
+#   GROUP_SIG[g]        — raw group signature;
+#   GROUP_FIRST[g]      — index of the group's first file in FILES_PATH
+#                         (the rest need not be adjacent — files_of_group);
+#   GROUP_COUNT[g]      — number of files in the group;
+#   GROUP_LENSMAKE[g], GROUP_LENSINFO[g] — LensMake/LensInfo of the group's
+#                         first file (not in the signature; detect_lens
+#                         needs them);
+#   SCAN_SKIPPED        — how many files exiftool counted that did not
+#                         make it into groups (control characters in the
+#                         path, read error).
+#
+# This is the only folder-reading path. After it main walks the groups.
+#
+# The field separator is US (\x1f, Unit Separator) both in exiftool output
+# and in GROUP_SIG. TAB does not work: bash `read` with whitespace in IFS
+# collapses consecutive separators, empty fields vanish and the following
+# ones shift left (empty LensModel → FocalLength is read as LensModel).
+# '|' in the signature would shift fields if LensModel contains it. US is
+# non-whitespace, is not collapsed, and does not occur in EXIF.
+SEP=$'\x1f'
+
+FILES_PATH=()
+FILES_GROUP=()
+GROUP_SIG=()
+GROUP_FIRST=()
+GROUP_COUNT=()
+GROUP_LENSMAKE=()
+GROUP_LENSINFO=()
+SCAN_SKIPPED=0
+
+scan_and_group() {
+    local folder="$1"
+    FILES_PATH=()
+    FILES_GROUP=()
+    GROUP_SIG=()
+    GROUP_FIRST=()
+    GROUP_COUNT=()
+    GROUP_LENSMAKE=()
+    GROUP_LENSINFO=()
+    SCAN_SKIPPED=0
+
+    # Format for exiftool: 8 US-separated fields. $TAG# gives the raw numeric
+    # value, without mm or units. -api missingtagvalue= makes missing tags
+    # empty. $SourceFile does not work in -p, so we use
+    # $Directory/$FileName. No -q: the parser drops exiftool's summary lines
+    # ("N image files read" etc.), and from "N files failed condition" it
+    # takes the number of files filtered out by -if — if everything is
+    # filtered out, there are no -progress lines and [N/M] would give 0.
+    # -progress gives "======== file [N/M]" lines — for the progress bar.
+    local fmt
+    fmt="\$Directory/\$FileName${SEP}\$Make${SEP}\$Model${SEP}\$LensModel"
+    fmt="${fmt}${SEP}\$FocalLength#${SEP}\$MaxApertureValue#${SEP}\$LensMake${SEP}\$LensInfo"
+    # Files and folders with control characters in the name (newline, TAB,
+    # US) are not read at all: line-based parsing would tear such a path
+    # apart, and a piece like "-all=" in the -@ argfile would be taken as an
+    # option.
+    # shellcheck disable=SC2016  # $Directory/$FileName are exiftool variables
+    local skip_ctrl='$Directory !~ /[\x00-\x1f]/ and $FileName !~ /[\x00-\x1f]/'
+    # Every path in the data must start with the folder (main makes it
+    # absolute): this filters out fragments and stray exiftool messages.
+    local prefix="${folder%/}/"
+
+    # Progress goes to stderr (stdout goes to data parsing).
+    # The bar is active only with a TTY stderr and a normal TERM (dumb cannot
+    # erase a line) and without --verbose; otherwise either serial output
+    # (--verbose) or silence (non-TTY).
+    local show_bar=0 verbose=0
+    [[ $VERBOSE_PROGRESS -eq 1 ]] && verbose=1
+    [[ -t 2 && $verbose -eq 0 && -n "${TERM:-}" && "${TERM:-}" != "dumb" ]] \
+        && show_bar=1
+
+    local total_files=0 failed_cond=0
+    local cols=0
+    if [[ $show_bar -eq 1 ]]; then
+        _term_size
+        cols=$TERM_COLS
+    fi
+
+    local line path make model lensmodel focal maxap lensmake lensinfo
+    local seps sig g group_idx
+    local cur n fname prefix_bar scan_word
+    _t 'Scanning: '
+    scan_word=$T
+    prefix_bar=$scan_word
+    local art=0
+    [[ $show_bar -eq 1 && "$NO_ART" != 1 ]] && art=1
+    if [[ $art -eq 1 ]]; then
+        _scan_spinner &
+        SPINNER_PID=$!
+        # Background jobs in a script ignore SIGINT, so on Ctrl-C we stop
+        # the spinner ourselves and die from INT, as without a trap (code
+        # 130).
+        trap '_stop_scan_spinner; trap - INT; kill -INT $$' INT
+    fi
+    # Process substitution: the while loop runs in this shell, arrays survive.
+    # 2>&1 merges stderr into stdout — in -p mode exiftool writes
+    # -progress to stderr, and we need to capture it here.
+    while IFS= read -r line; do
+        # Progress event.
+        if [[ "$line" =~ ^========\ (.+)\ \[([0-9]+)/([0-9]+)\]$ ]]; then
+            cur=${BASH_REMATCH[2]}
+            n=${BASH_REMATCH[3]}
+            if [[ $show_bar -eq 1 ]]; then
+                fname=$(basename "${BASH_REMATCH[1]}")
+                if [[ $art -eq 1 ]]; then
+                    _stop_scan_spinner
+                    # The aperture keeps "breathing" — one frame per file.
+                    prefix_bar="${APERTURE_FRAMES[cur % ${#APERTURE_FRAMES[@]}]} $scan_word"
+                fi
+                _draw_progress "$prefix_bar" "$cur" "$n" "$fname" "$cols" >&2
+            elif [[ $verbose -eq 1 ]]; then
+                printf '%s\n' "$line" >&2
+            fi
+            total_files=$n
+            continue
+        fi
+
+        # exiftool summary: how many files -if filtered out.
+        if [[ "$line" =~ ^\ *([0-9]+)\ files\ failed\ condition$ ]]; then
+            failed_cond=${BASH_REMATCH[1]}
+            continue
+        fi
+
+        # exiftool warnings / errors — ignored (they arrive in stderr→stdout
+        # via 2>&1). If they were allowed to "fall through" to the data
+        # parser, they would end up in FILES_PATH as "files".
+        case "$line" in
+            Warning:*|Error:*) continue ;;
+        esac
+
+        # A data line: exactly 7 separators, a path inside the folder and
+        # an existing file. Anything else (exiftool messages without a prefix,
+        # fragments) is not a file.
+        seps=${line//[^$SEP]/}
+        [[ ${#seps} -eq 7 ]] || continue
+        IFS=$SEP read -r path make model lensmodel focal maxap lensmake lensinfo \
+            <<<"$line"
+        [[ "$path" == "$prefix"* && -f "$path" ]] || continue
+        sig="${make}${SEP}${model}${SEP}${lensmodel}${SEP}${focal}${SEP}${maxap}"
+
+        group_idx=-1
+        for ((g=0; g<${#GROUP_SIG[@]}; g++)); do
+            if [[ "${GROUP_SIG[$g]}" == "$sig" ]]; then
+                group_idx=$g
+                break
+            fi
+        done
+
+        if [[ $group_idx -lt 0 ]]; then
+            group_idx=${#GROUP_SIG[@]}
+            GROUP_SIG+=("$sig")
+            GROUP_FIRST+=(${#FILES_PATH[@]})
+            GROUP_COUNT+=(1)
+            GROUP_LENSMAKE+=("$lensmake")
+            GROUP_LENSINFO+=("$lensinfo")
+        else
+            GROUP_COUNT[group_idx]=$((GROUP_COUNT[group_idx] + 1))
+        fi
+        FILES_PATH+=("$path")
+        FILES_GROUP+=("$group_idx")
+    done < <(exiftool -progress -m -api 'missingtagvalue=' -p "$fmt" \
+                -if "$skip_ctrl" \
+                -ext jpg -ext jpeg -ext nef -ext raf -ext tif -ext tiff \
+                -ext dng -ext arw -ext cr2 -ext cr3 \
+                -r "$folder" 2>&1)
+
+    # No files found — the spinner is still running.
+    _stop_scan_spinner
+    # Close the progress line if it was drawn.
+    # if/then (not &&) matters: on false under set -e the function returns 1
+    # and main fails after the very first run without a TTY stderr.
+    if [[ $show_bar -eq 1 && $total_files -gt 0 ]]; then
+        printf '\n' >&2
+    fi
+    # [N/M] in progress — M counts all files found, including filtered ones.
+    # No progress lines when -if filtered out everything — use exiftool's
+    # total.
+    if [[ $total_files -gt ${#FILES_PATH[@]} ]]; then
+        SCAN_SKIPPED=$((total_files - ${#FILES_PATH[@]}))
+    elif [[ $total_files -eq 0 && $failed_cond -gt 0 ]]; then
+        SCAN_SKIPPED=$failed_cond
+    fi
+}
+
+# Collects the array of paths of one group's files. Result in FILES_OF_GROUP.
+files_of_group() {
+    local g="$1" i
+    FILES_OF_GROUP=()
+    for ((i=0; i<${#FILES_PATH[@]}; i++)); do
+        if [[ "${FILES_GROUP[$i]}" -eq "$g" ]]; then
+            FILES_OF_GROUP+=("${FILES_PATH[$i]}")
+        fi
+    done
+}
+
+# ─── Database lookup ──────────────────────────────────────────────────────
+
+# Prints the index of needle among the remaining arguments (exact match,
+# no glob) or -1. Pass an array as ${arr[@]+"${arr[@]}"}: an empty
+# "${arr[@]}" under set -u in bash 3.2 fails with "unbound variable".
+index_of() {
+    local needle="$1" i=0 v
+    shift
+    for v in "$@"; do
+        if [[ "$v" == "$needle" ]]; then
+            printf '%d\n' "$i"; return 0
+        fi
+        i=$((i + 1))
+    done
+    printf '%d\n' -1
+}
+
+# ─── Auto-detection ───────────────────────────────────────────────────────
+
+# Prints the index of the detected camera or -1. Arguments: Make, Model —
+# group signature fields from scan_and_group (no separate exiftool run is
+# needed, and an empty Make does not shift Model into its place).
+detect_camera() {
+    local make="$1" model="$2" i
+    for ((i=0; i<${#CAM_IDS[@]}; i++)); do
+        if [[ "$make" =~ ${CAM_MAKE_PATTERNS[$i]} ]] \
+           && [[ "$model" =~ ${CAM_MODEL_PATTERNS[$i]} ]]; then
+            printf '%d\n' "$i"; return 0
+        fi
+    done
+    printf '%d\n' -1
+}
+
+# |a - b| <= tol (floating-point numbers). Exit code 0/1.
+within_tol() {
+    awk -v a="$1" -v b="$2" -v tol="$3" \
+        'BEGIN { d=a-b; if (d<0) d=-d; exit !(d<=tol) }'
+}
+
+# Result of detect_lens (globals, not stdout: two values are needed):
+#   DETECT_LENS_IDX       — index of the guessed lens or -1;
+#   DETECT_LENS_AMBIGUOUS — on -1: ids of equally valid candidates joined
+#                           by ", " (empty if there are no candidates).
+DETECT_LENS_IDX=-1
+DETECT_LENS_AMBIGUOUS=""
+
+# Guesses the lens. Arguments are group fields from scan_and_group:
+#   FocalLength#, MaxApertureValue#, LensModel, LensMake, LensInfo.
+# Logic:
+# 1) if EXIF LensModel contains a model from the database (and LensMake is
+#    empty or matches too) — take it;
+# 2) otherwise match by FocalLength with a ±0.5 mm tolerance;
+# 3) with several candidates, resolve by MaxApertureValue (±0.05; when
+#    empty, the f-number from LensInfo is used). No aperture — not guessed.
+# If more than one candidate remains after step 1 or 3, that is not a
+# guess but a pick by database line order: the result is -1 and the
+# candidate list goes to DETECT_LENS_AMBIGUOUS. A single focal-length
+# candidate is taken without an aperture check: MaxApertureValue from EXIF
+# cannot be the primary criterion (see README).
+detect_lens() {
+    local focal="$1" max_ap="$2" lens_model="$3" lens_make="$4" lens_info="$5"
+    local i
+    DETECT_LENS_IDX=-1
+    DETECT_LENS_AMBIGUOUS=""
+
+    # Fallback: if MaxApertureValue is empty (happens with adapters — Shoten
+    # passes the focal length but not the aperture), try to get the max
+    # aperture from LensInfo like "58mm f/1.9". Without this, the f-number
+    # tie-break between two equal focal lengths (Primoplan 58/1.9 vs
+    # Helios-44 58/2) would not work.
+    if [[ -z "$max_ap" && "$lens_info" =~ f/([0-9]+(\.[0-9]+)?) ]]; then
+        max_ap="${BASH_REMATCH[1]}"
+    fi
+
+    # Step 1: an already tagged lens.
+    local matches=()
+    if [[ -n "$lens_model" ]]; then
+        for ((i=0; i<${#LENS_IDS[@]}; i++)); do
+            if contains_ci "$lens_model" "${LENS_MODELS[$i]}"; then
+                if [[ -z "$lens_make" ]] || contains_ci "$lens_make" "${LENS_MAKES[$i]}"; then
+                    matches+=("$i")
+                fi
+            fi
+        done
+    fi
+    if [[ ${#matches[@]} -eq 0 && -n "$focal" ]]; then
+        # Step 2: by focal length. If 1 candidate — that one; if more —
+        # step 3, keep only those matching MaxApertureValue.
+        local candidates=()
+        for ((i=0; i<${#LENS_IDS[@]}; i++)); do
+            if within_tol "$focal" "${LENS_FOCALS[$i]}" "$DETECT_FOCAL_TOLERANCE_MM"; then
+                candidates+=("$i")
+            fi
+        done
+        # ≤1 candidate — no aperture filter needed (and an empty array
+        # does not reach the loop below).
+        if [[ ${#candidates[@]} -le 1 || -z "$max_ap" ]]; then
+            # An empty array must not be expanded under set -u in bash 3.2.
+            if [[ ${#candidates[@]} -gt 0 ]]; then
+                matches=("${candidates[@]}")
+            fi
+        else
+            for i in "${candidates[@]}"; do
+                if within_tol "$max_ap" "${LENS_MAX_APS[$i]}" "$DETECT_APERTURE_TOLERANCE"; then
+                    matches+=("$i")
+                fi
+            done
+        fi
+    fi
+
+    if [[ ${#matches[@]} -eq 1 ]]; then
+        DETECT_LENS_IDX=${matches[0]}
+    elif [[ ${#matches[@]} -gt 1 ]]; then
+        for i in "${matches[@]}"; do
+            DETECT_LENS_AMBIGUOUS="${DETECT_LENS_AMBIGUOUS:+$DETECT_LENS_AMBIGUOUS, }${LENS_IDS[$i]}"
+        done
+    fi
+    return 0
+}
+
+# ─── Group formatting ────────────────────────────────────────────────────
+
+# Prints one table row — a group description. Three kinds below.
+# Columns are sized by the contents of ALL groups: the caller first
+# collects the widths via group_table_widths(), then prints.
+#
+#   preview — the intro list (before the commit phase), from GROUP_SIG[g]:
+#       "  [N]  K  Make Model · Lens"
+#   plan    — the "Write plan" block, commit results:
+#       "  [N]  K  Camera         Lens"         (commit)
+#       "  [N]  K  skip"                        (skip)
+#   final   — the final summary:
+#       "  [N]  tagged    K  Camera  Lens"      (commit)
+#       "  [N]  skipped   K  —       —"         (skip)
+#       "  [N]  failed    K  Camera  Lens"      (failed — exiftool failed)
+#
+# Widths are passed through GROUP_W_* globals — bash 3.2 dislikes array args.
+
+GROUP_W_NUM=0    # width of the "#" column (3 for [1] / 4 for [10])
+GROUP_W_COUNT=0  # width of the "Files" column (numbers)
+GROUP_W_CAM=0    # width of the camera column
+# Lens is always the last column, unaligned: no width needed.
+GROUP_W_STATUS=0  # "Status" column in final: longest status + 1
+
+# Computes GROUP_W_*. Argument: kind (preview|plan|final) — determines
+# the column set and where the values come from.
+group_table_widths() {
+    local kind="$1"
+    local groups=${#GROUP_SIG[@]} g
+    # `(( ))` under `set -e` fails on a false expression; use if/then
+    # wherever it is "condition → assignment".
+    if [[ $groups -ge 10 ]]; then GROUP_W_NUM=4; else GROUP_W_NUM=3; fi
+    # Start from the header widths.
+    _t 'Files';  GROUP_W_COUNT=${#T}
+    _t 'Camera'; GROUP_W_CAM=${#T}
+    local st=()
+    _t 'Status';  st+=("$T")
+    _t 'tagged';  st+=("$T")
+    _t 'failed';  st+=("$T")
+    _t 'skipped'; st+=("$T")
+    _max_len "${st[@]}"
+    GROUP_W_STATUS=$((MAX_LEN + 1))
+    local sval cam
+    for ((g=0; g<groups; g++)); do
+        sval=${#GROUP_COUNT[$g]}
+        if (( sval > GROUP_W_COUNT )); then GROUP_W_COUNT=$sval; fi
+        case "$kind" in
+            preview)
+                # "Camera" in preview = make+model from the signature
+                local sig_make sig_model
+                IFS=$SEP read -r sig_make sig_model _ _ _ <<<"${GROUP_SIG[$g]}"
+                sval=${#sig_make}
+                if (( ${#sig_model} > 0 )); then
+                    sval=$((sval + 1 + ${#sig_model}))
+                fi
+                if (( sval > GROUP_W_CAM )); then GROUP_W_CAM=$sval; fi
+                ;;
+            plan|final)
+                if [[ "${GROUP_RESULT_STATUS[$g]:-}" == "commit" \
+                      || "${GROUP_RESULT_STATUS[$g]:-}" == "failed" ]]; then
+                    cam="${GROUP_RESULT_CAM[$g]}"
+                    sval=${#CAM_DISPLAYS[$cam]}
+                    if (( sval > GROUP_W_CAM )); then GROUP_W_CAM=$sval; fi
+                fi
+                ;;
+        esac
+    done
+}
+
+format_group_line() {
+    local g="$1" kind="$2"
+    local count="${GROUP_COUNT[$g]}"
+    local status="${GROUP_RESULT_STATUS[$g]:-}"
+    local cam lens num_str
+    num_str="[$((g+1))]"
+
+    case "$kind" in
+        preview)
+            local sig_make sig_model sig_lensmodel sig_focal sig_maxap
+            IFS=$SEP read -r sig_make sig_model sig_lensmodel sig_focal sig_maxap \
+                <<<"${GROUP_SIG[$g]}"
+            local cam_str="${sig_make:-?} ${sig_model:-?}"
+            local lens_str="—"
+            if [[ -n "$sig_lensmodel" ]]; then
+                lens_str="$sig_lensmodel"
+            elif [[ -n "$sig_focal" ]]; then
+                lens_str="${sig_focal}mm"
+                [[ -n "$sig_maxap" ]] && lens_str="${lens_str} f/${sig_maxap}"
+            fi
+            printf '  %s  %s  %s  %s\n' \
+                   "$(pad "$num_str" "$GROUP_W_NUM")" \
+                   "$(pad "$count" "$GROUP_W_COUNT")" \
+                   "$(pad "$cam_str" "$GROUP_W_CAM")" \
+                   "$lens_str"
+            ;;
+        plan)
+            if [[ "$status" == "commit" ]]; then
+                cam="${GROUP_RESULT_CAM[$g]}"
+                lens="${GROUP_RESULT_LENS[$g]}"
+                printf '  %s  %s  %s  %s\n' \
+                       "$(pad "$num_str" "$GROUP_W_NUM")" \
+                       "$(pad "$count" "$GROUP_W_COUNT")" \
+                       "$(pad "${CAM_DISPLAYS[$cam]}" "$GROUP_W_CAM")" \
+                       "${LENS_DISPLAYS[$lens]}"
+            else
+                _t 'skip'
+                printf '  %s  %s  %s\n' \
+                       "$(pad "$num_str" "$GROUP_W_NUM")" \
+                       "$(pad "$count" "$GROUP_W_COUNT")" \
+                       "$T"
+            fi
+            ;;
+        final)
+            local status_str cam_str lens_str
+            if [[ "$status" == "commit" || "$status" == "failed" ]]; then
+                cam="${GROUP_RESULT_CAM[$g]}"
+                lens="${GROUP_RESULT_LENS[$g]}"
+                _t 'tagged'; status_str=$T
+                if [[ "$status" == "failed" ]]; then _t 'failed'; status_str=$T; fi
+                cam_str="${CAM_DISPLAYS[$cam]}"
+                lens_str="${LENS_DISPLAYS[$lens]}"
+            else
+                _t 'skipped'; status_str=$T
+                cam_str="—"
+                lens_str="—"
+            fi
+            printf '  %s  %s  %s  %s  %s\n' \
+                   "$(pad "$num_str" "$GROUP_W_NUM")" \
+                   "$(pad "$status_str" "$GROUP_W_STATUS")" \
+                   "$(pad "$count" "$GROUP_W_COUNT")" \
+                   "$(pad "$cam_str" "$GROUP_W_CAM")" \
+                   "$lens_str"
+            ;;
+    esac
+}
+
+# Prints the group table header. Must be called after group_table_widths.
+group_table_header() {
+    local kind="$1" h_num h_status h_files h_cam h_lens
+    _t '#';      h_num=$T
+    _t 'Status'; h_status=$T
+    _t 'Files';  h_files=$T
+    _t 'Camera'; h_cam=$T
+    _t 'Lens';   h_lens=$T
+    case "$kind" in
+        preview|plan)
+            printf '  %s  %s  %s  %s\n' \
+                   "$(pad "$h_num" "$GROUP_W_NUM")" \
+                   "$(pad "$h_files" "$GROUP_W_COUNT")" \
+                   "$(pad "$h_cam" "$GROUP_W_CAM")" \
+                   "$h_lens"
+            ;;
+        final)
+            printf '  %s  %s  %s  %s  %s\n' \
+                   "$(pad "$h_num" "$GROUP_W_NUM")" \
+                   "$(pad "$h_status" "$GROUP_W_STATUS")" \
+                   "$(pad "$h_files" "$GROUP_W_COUNT")" \
+                   "$(pad "$h_cam" "$GROUP_W_CAM")" \
+                   "$h_lens"
+            ;;
+    esac
+}
+
+# ─── Printing lists ───────────────────────────────────────────────────────
+
+# Prints a table row: $1 — space-separated column widths, then the
+# values. Each value that has a width is padded with pad() (by
+# characters, not bytes like `printf %-Ns`), columns are separated by two
+# spaces; values beyond the widths (the last column) go as is.
+_print_table_row() {
+    local widths=() out="" i=0 v
+    read -r -a widths <<<"$1"
+    shift
+    for v in "$@"; do
+        if (( i < ${#widths[@]} )); then
+            out="${out}$(pad "$v" "${widths[$i]}")  "
+        else
+            out="${out}${v}"
+        fi
+        i=$((i + 1))
+    done
+    printf '%s\n' "$out"
+}
+
+# Widens the columns to fit a row: $1 — current space-separated widths,
+# then the values. Column width = max(own, value length in characters);
+# values beyond the widths (the last column) are ignored. Result in
+# TABLE_W (a string for _print_table_row).
+_grow_table_widths() {
+    local widths=() i=0 v
+    read -r -a widths <<<"$1"
+    shift
+    for v in "$@"; do
+        if (( i < ${#widths[@]} && ${#v} > widths[i] )); then
+            widths[i]=${#v}
+        fi
+        i=$((i + 1))
+    done
+    TABLE_W="${widths[*]}"
+}
+
+# --list-lenses row for lens $1 → LIST_ROW (array of values).
+_lens_list_row() {
+    local i="$1" gen="${LENS_GENERATIONS[$1]}"
+    [[ -z "$gen" ]] && gen="—"
+    _t 'mm'
+    LIST_ROW=("${LENS_IDS[$i]}" "${LENS_MAKES[$i]}" "${LENS_MODELS[$i]}"
+              "${LENS_FOCALS[$i]}$T" "f/${LENS_MAX_APS[$i]}" "$gen"
+              "${LENS_SERIALS[$i]}")
+}
+
+# --list-cameras row for camera $1 → LIST_ROW (array of values).
+_camera_list_row() {
+    local i="$1" mn="${CAM_MN_GROUPS[$1]}"
+    [[ -z "$mn" ]] && mn="—"
+    LIST_ROW=("${CAM_IDS[$i]}" "${CAM_DISPLAYS[$i]}" "${CAM_CROPS[$i]}"
+              "$mn" "${CAM_HAS_LENS[$i]}")
+}
+
+# List column widths come from the data (max of header and all values),
+# like _lens_menu_widths for the menu: fixed widths broke as soon as an
+# ID or generation longer than the column got into the database.
+print_lens_list() {
+    local hdr=("ID")
+    _t 'Make';   hdr+=("$T")
+    _t 'Model';  hdr+=("$T")
+    _t 'Focal';  hdr+=("$T")
+    hdr+=("f/")
+    _t 'Gen.';   hdr+=("$T")
+    _t 'Serial'; hdr+=("$T")
+    local i
+    TABLE_W="0 0 0 0 0 0"
+    _grow_table_widths "$TABLE_W" "${hdr[@]}"
+    for ((i=0; i<${#LENS_IDS[@]}; i++)); do
+        _lens_list_row "$i"
+        _grow_table_widths "$TABLE_W" "${LIST_ROW[@]}"
+    done
+    _print_table_row "$TABLE_W" "${hdr[@]}"
+    for ((i=0; i<${#LENS_IDS[@]}; i++)); do
+        _lens_list_row "$i"
+        _print_table_row "$TABLE_W" "${LIST_ROW[@]}"
+    done
+}
+
+print_camera_list() {
+    local hdr=("ID")
+    _t 'Camera'; hdr+=("$T")
+    _t 'Crop';   hdr+=("$T" "MakerNote" "Nikon:Lens")
+    local i
+    TABLE_W="0 0 0 0"
+    _grow_table_widths "$TABLE_W" "${hdr[@]}"
+    for ((i=0; i<${#CAM_IDS[@]}; i++)); do
+        _camera_list_row "$i"
+        _grow_table_widths "$TABLE_W" "${LIST_ROW[@]}"
+    done
+    _print_table_row "$TABLE_W" "${hdr[@]}"
+    for ((i=0; i<${#CAM_IDS[@]}; i++)); do
+        _camera_list_row "$i"
+        _print_table_row "$TABLE_W" "${LIST_ROW[@]}"
+    done
+}
+
+# ─── Summary ──────────────────────────────────────────────────────────────
+
+# Prints the "tag preview" — the key EXIF tags that will be written for
+# a camera/lens index pair. Used in the plan view: drawn for every
+# committed group so that the values are visible before confirmation.
+_print_tag_preview_for() {
+    local cam_idx="$1" lens_idx="$2"
+    [[ $cam_idx -lt 0 || $lens_idx -lt 0 ]] && return 0
+
+    local lens_make="${LENS_MAKES[$lens_idx]}"
+    local lens_model="${LENS_MODELS[$lens_idx]}"
+    local focal="${LENS_FOCALS[$lens_idx]}"
+    local max_ap="${LENS_MAX_APS[$lens_idx]}"
+    local serial="${LENS_SERIALS[$lens_idx]}"
+    local lens_string="${LENS_STRINGS[$lens_idx]}"
+    local crop="${CAM_CROPS[$cam_idx]}"
+    local mn_group="${CAM_MN_GROUPS[$cam_idx]}"
+    local equiv
+    equiv=$(equiv_focal "$focal" "$crop")
+
+    tprintf '\nTo be written:\n'
+    printf '  LensMake          = %s\n' "$lens_make"
+    printf '  LensModel         = %s\n' "$lens_model"
+    # The serial is always written: empty clears one left by a past tagging.
+    if [[ -n "$serial" ]]; then
+        printf '  LensSerialNumber  = %s\n' "$serial"
+    else
+        tprintf '  LensSerialNumber  = (none — the old one is cleared)\n'
+    fi
+    printf '  LensInfo          = %s %s %s %s  («%smm f/%s»)\n' \
+           "$focal" "$focal" "$max_ap" "$max_ap" "$focal" "$max_ap"
+    tprintf '  FocalLength       = %s mm\n' "$focal"
+    tprintf '  35mm equivalent   = %s mm (×%s)\n' "$equiv" "$crop"
+    printf '  MaxApertureValue  = f/%s\n' "$max_ap"
+    if [[ -n "$mn_group" ]]; then
+        if mn_writes_nikon_lens "$cam_idx"; then
+            tprintf '  MakerNote (%s) = focal length + aperture + Lens="%s"\n' \
+                   "$mn_group" "$lens_string"
+        else
+            tprintf '  MakerNote (%s) = focal length + aperture\n' "$mn_group"
+        fi
+    fi
+}
+
+# Summary line "  Key:  value    ← tag". Arguments: key, key width,
+# value, value column width, tag (empty — no tag), cols.
+# cols=0 — tag in the shared column (value padded to the width).
+# cols>0 — the shared column did not fit the window: tag right after the
+# value, and if even that is wider than the window — on its own line below
+# value. $7, $8, $9 — key, value, tag colors (CARD_STYLE; widths exclude
+# them).
+_summary_line() {
+    local key="$1" key_w="$2" val="$3" val_w="$4" tag="$5" cols="$6"
+    local kc="${7:-}" vc="${8:-}" tc="${9:-}" key_str
+    key_str="$CARD_IND$kc$(pad "$key" "$key_w")$CS_R"
+    if [[ -z "$tag" ]]; then
+        printf '  %s %s\n' "$key_str" "$vc$val$CS_R"
+    elif (( cols == 0 )); then
+        printf '  %s %s%*s    %s\n' "$key_str" "$vc$val$CS_R" $((val_w - ${#val})) '' "$tc$tag$CS_R"
+    elif (( 2 + ${#CARD_IND} + key_w + 1 + ${#val} + 4 + ${#tag} <= cols )); then
+        printf '  %s %s    %s\n' "$key_str" "$vc$val$CS_R" "$tc$tag$CS_R"
+    else
+        printf '  %s %s\n  %s%s %s\n' "$key_str" "$vc$val$CS_R" "$CARD_IND" "$(pad "" "$key_w")" "$tc$tag$CS_R"
+    fi
+}
+
+# Prints the current "camera + lens" state as a key=value table.
+# In "guessed" mode (first display) adds "← detected / ← not guessed" on
+# the right — this is the first moment the user sees the detect result
+# and must immediately understand what to confirm and what to change.
+print_summary() {
+    local mode="$1"
+    local show_arrows=0
+    [[ "$mode" == "guessed" ]] && show_arrows=1
+
+    local key_w k_cam k_lens ok="← " warn="← "
+    if [[ $CARD_STYLE -eq 1 ]]; then
+        _t 'Camera'; k_cam=$T
+        _t 'Lens';   k_lens=$T
+        ok="✓ "; warn="? "
+    else
+        _t 'Camera:'; k_cam=$T
+        _t 'Lens:';   k_lens=$T
+    fi
+    # Key column: the longer key plus a space.
+    _max_len "$k_cam" "$k_lens"
+    key_w=$((MAX_LEN + 1))
+
+    # Camera and lens values (without arrows). In CARD_STYLE the generation
+    # and serial go on a separate faint line under the lens (lens_detail).
+    local cam_val lens_val lens_detail=""
+    if [[ $CAM_IDX -ge 0 ]]; then
+        cam_val="${CAM_DISPLAYS[$CAM_IDX]}"
+    else
+        cam_val="—"
+    fi
+    if [[ $LENS_IDX -ge 0 ]]; then
+        local gen="${LENS_GENERATIONS[$LENS_IDX]}"
+        local serial="${LENS_SERIALS[$LENS_IDX]}"
+        lens_val="${LENS_DISPLAYS[$LENS_IDX]}"
+        [[ -n "$gen" ]] && lens_detail="$gen"
+        [[ -n "$serial" ]] && lens_detail="${lens_detail:+$lens_detail · }s/n ${serial}"
+        if [[ $CARD_STYLE -ne 1 && -n "$lens_detail" ]]; then
+            lens_val="${lens_val} · ${lens_detail}"
+            lens_detail=""
+        fi
+    else
+        lens_val="—"
+    fi
+
+    # Arrows are aligned into a shared column by the max value length.
+    local val_w=${#cam_val}
+    if (( ${#lens_val} > val_w )); then val_w=${#lens_val}; fi
+    local cam_tag="" lens_tag="" cam_tc="$CS_OK" lens_tc="$CS_OK"
+    if [[ $show_arrows -eq 1 ]]; then
+        if [[ $CAM_IDX -ge 0 ]]; then _t 'detected'; cam_tag="$ok$T"
+        else _t 'not detected'; cam_tag="$warn$T"; cam_tc="$CS_WARN"; fi
+        if [[ $LENS_IDX -ge 0 ]]; then
+            _t 'guessed'; lens_tag="$ok$T"
+        elif [[ -n "$DETECT_LENS_AMBIGUOUS" ]]; then
+            _t 'ambiguous:'; lens_tag="$warn$T $DETECT_LENS_AMBIGUOUS"; lens_tc="$CS_WARN"
+        else
+            _t 'not guessed'; lens_tag="$warn$T"; lens_tc="$CS_WARN"
+        fi
+    fi
+    # The shared arrow column does not fit the window (a long lens with a
+    # generation and serial) — lines would wrap. Then no shared column
+    # (cols>0 → _summary_line puts the arrow right after the value or, if
+    # even that does not fit, on its own line below the value).
+    # Width matters only for a terminal: no wrapping in a file or a pipe.
+    local cols=0
+    if [[ -n "$cam_tag$lens_tag" && -t 1 ]]; then
+        local tag_w=${#cam_tag}
+        if (( ${#lens_tag} > tag_w )); then tag_w=${#lens_tag}; fi
+        _term_size
+        if (( TERM_COLS > 0 && 2 + ${#CARD_IND} + key_w + 1 + val_w + 4 + tag_w > TERM_COLS )); then
+            cols=$TERM_COLS
+        fi
+    fi
+
+    _summary_line "$k_cam" "$key_w" "$cam_val" "$val_w" "$cam_tag" "$cols" "$CS_D" "" "$cam_tc"
+    _summary_line "$k_lens" "$key_w" "$lens_val" "$val_w" "$lens_tag" "$cols" "$CS_D" "$CS_B" "$lens_tc"
+    if [[ -n "$lens_detail" ]]; then
+        printf '  %s%*s %s%s%s\n' "$CARD_IND" "$key_w" '' "$CS_D" "$lens_detail" "$CS_R"
+    fi
+}
+
+# ─── Menus ────────────────────────────────────────────────────────────────
+
+# Why a line could not be read from /dev/tty: Ctrl-D on a live terminal
+# (EOF) or no terminal at all. For messages — so that Ctrl-D does not
+# look like "no terminal".
+_tty_closed_reason() {
+    if { : </dev/tty; } 2>/dev/null; then
+        tprintf 'input closed (EOF, Ctrl-D)'
+    else
+        tprintf 'no terminal'
+    fi
+}
+
+# The "interaction broke off" error (prompt returned notty / -2). The hint
+# about --no-confirm only when there really is no terminal.
+_tty_lost_err() {
+    local reason
+    reason=$(_tty_closed_reason)
+    _t 'no terminal'
+    if [[ "$reason" == "$T" ]]; then
+        errf 'terminal lost — nothing written (use --no-confirm)'
+    else
+        errf '%s — nothing written' "$reason"
+    fi
+}
+
+# Generic choice from a list. Prints to stdout the index (0-based), -1
+# (the user entered 0) or -2 (EOF / no terminal and no default).
+# Writes the UI to stderr. Arguments:
+#   $1 — title
+#   $2 — default index (or -1 if there is no default)
+#   $3 — label of the "0)" item
+#   $4 — table header above the items (empty — no header)
+#   $5 — divider under the header (empty — none)
+#   $6… — item labels (as a list, no indirect references — bash 3.2).
+prompt_choice() {
+    local title="$1"
+    local default_idx="$2"
+    local cancel_label="$3"
+    local table_header="$4" table_divider="$5"
+    shift 5
+    local labels=("$@")
+
+    # Blank lines before and after the item list — visual "breathing room"
+    # between title / menu / prompt line. Applies to all menus
+    # (both cameras and lenses).
+    printf '\n%s\n\n' "$title" >&2
+
+    # Optional table header — an aligned line with column names, must
+    # match the layout of labels. Used only
+    # for the lens menu.
+    if [[ -n "$table_header" ]]; then
+        # The "   " indent = "* 1) " is 5 wide (marker + number) for 1..9.
+        # 10+ needs 6. Computed from the number of labels.
+        local hdr_pad="     "
+        [[ ${#labels[@]} -ge 10 ]] && hdr_pad="      "
+        printf '%s%s\n' "$hdr_pad" "$table_header" >&2
+        if [[ -n "$table_divider" ]]; then
+            printf '%s%s\n' "$hdr_pad" "$table_divider" >&2
+        fi
+    fi
+    local i marker num_w
+    # Number width: 1 digit for 1..9, 2 for 10..99.
+    num_w=1
+    [[ ${#labels[@]} -ge 10 ]] && num_w=2
+    for ((i=0; i<${#labels[@]}; i++)); do
+        marker="  "
+        [[ $i -eq $default_idx ]] && marker="* "
+        printf '%s%*d) %s\n' "$marker" "$num_w" "$((i+1))" "${labels[$i]}" >&2
+    done
+    printf '  0) %s\n\n' "$cancel_label" >&2
+
+    local default_label="—"
+    [[ $default_idx -ge 0 ]] && default_label="$((default_idx+1))"
+
+    local input n
+    while true; do
+        tprintf 'Number [%s]: ' "$default_label" >&2
+        # Reset before every read: if /dev/tty fails to open, read does not
+        # touch input, and the previous (invalid) input would remain in it.
+        input=""
+        # 2>/dev/null before </dev/tty: else bash prints the tty open error
+        # before stderr is silenced. Input without Enter, closed by Ctrl-D
+        # ("3" + Ctrl-D Ctrl-D): read returns an error, but input is not
+        # empty — parse it as a normal line below.
+        if ! IFS= read -r input 2>/dev/null </dev/tty && [[ -z "$input" ]]; then
+            # EOF / tty unavailable. With a default — take it, without — exit.
+            if [[ $default_idx -ge 0 ]]; then
+                printf '\n' >&2
+                printf '%d\n' "$default_idx"; return 0
+            fi
+            tprintf '\n%s and no guessed value — cancelled\n' \
+                   "$(_tty_closed_reason)" >&2
+            tprintf '(hint: --camera ID / --lens ID for scripted runs)\n' >&2
+            printf '%d\n' -2; return 0
+        fi
+        if [[ -z "$input" ]]; then
+            if [[ $default_idx -ge 0 ]]; then
+                printf '%d\n' "$default_idx"; return 0
+            fi
+            tprintf 'no guessed value, enter a number\n' >&2
+            continue
+        fi
+        if [[ "$input" == "0" ]]; then
+            printf '%d\n' -1; return 0
+        fi
+        if [[ "$input" =~ ^[0-9]+$ ]]; then
+            # 10#: input with a leading zero is decimal, not octal
+            # ("010" is item 10, "08" is item 8, not an arithmetic error).
+            n=$((10#$input - 1))
+            if [[ $n -ge 0 && $n -lt ${#labels[@]} ]]; then
+                printf '%d\n' "$n"; return 0
+            fi
+        fi
+        tprintf 'invalid input, enter 0..%d\n' "${#labels[@]}" >&2
+    done
+}
+
+# Camera choice. Uses CAM_IDX as the default. $1 — label of the "0)" item.
+# Prints the new index, -1 (0 in the menu) or -2 (EOF/no terminal).
+prompt_camera() {
+    local cancel_label="$1"
+    local labels=()
+    local i
+    for ((i=0; i<${#CAM_IDS[@]}; i++)); do
+        labels+=("${CAM_DISPLAYS[$i]}")
+    done
+    local title
+    if [[ $CAM_IDX -ge 0 ]]; then
+        _t 'Choose a camera (Enter keeps the detected one):'
+    else
+        _t 'Choose a camera:'
+    fi
+    title=$T
+    prompt_choice "$title" "$CAM_IDX" "$cancel_label" "" "" "${labels[@]}"
+}
+
+# Lens menu column widths → LENS_MENU_W_LENS / _GEN / _SERIAL.
+# The starting width of each column = header length (so the header does
+# not stick out). Then widen to fit the contents. Shared by prompt_lens and
+# the menu height estimate (_lens_menu_rows).
+_t 'Lens';   LENS_MENU_HDR_LENS=$T
+_t 'Gen.';   LENS_MENU_HDR_GEN=$T
+_t 'Serial'; LENS_MENU_HDR_SERIAL=$T
+_lens_menu_widths() {
+    local i gen serial
+    LENS_MENU_W_LENS=${#LENS_MENU_HDR_LENS}
+    LENS_MENU_W_GEN=${#LENS_MENU_HDR_GEN}
+    LENS_MENU_W_SERIAL=${#LENS_MENU_HDR_SERIAL}
+    for ((i=0; i<${#LENS_IDS[@]}; i++)); do
+        if (( ${#LENS_DISPLAYS[$i]} > LENS_MENU_W_LENS )); then
+            LENS_MENU_W_LENS=${#LENS_DISPLAYS[$i]}
+        fi
+        gen="${LENS_GENERATIONS[$i]}"
+        [[ -z "$gen" ]] && gen="—"
+        if (( ${#gen} > LENS_MENU_W_GEN )); then
+            LENS_MENU_W_GEN=${#gen}
+        fi
+        serial="${LENS_SERIALS[$i]}"
+        if (( ${#serial} > LENS_MENU_W_SERIAL )); then
+            LENS_MENU_W_SERIAL=${#serial}
+        fi
+    done
+}
+
+# Height of the prompt_choice menu in screen lines (with wrapping at the
+# window width, by the longest line — an upper estimate). Arguments: number
+# of items, max label length, number of table header lines, title length.
+# Result in MENU_ROWS. +2 slack for one input error.
+_menu_rows() {
+    local n="$1" label_w="$2" hdr_lines="$3" title_len="$4"
+    local num_w=1 item_rows
+    [[ $n -ge 10 ]] && num_w=2
+    _term_size
+    _rows_for "$title_len"
+    # Title plus blank, title, blank; "0)", blank, prompt.
+    MENU_ROWS=$((ROWS_FOR + 5 + 2))
+    _rows_for $((2 + num_w + 2 + label_w))
+    item_rows=$ROWS_FOR
+    MENU_ROWS=$((MENU_ROWS + n * item_rows + hdr_lines * item_rows))
+}
+
+# Camera menu height → MENU_ROWS.
+_camera_menu_rows() {
+    local i w=0
+    for ((i=0; i<${#CAM_IDS[@]}; i++)); do
+        if (( ${#CAM_DISPLAYS[$i]} > w )); then w=${#CAM_DISPLAYS[$i]}; fi
+    done
+    _menu_rows "${#CAM_IDS[@]}" "$w" 0 50
+}
+
+# Lens menu height → MENU_ROWS. The title may carry the list of
+# ambiguous candidates — account for its length.
+_lens_menu_rows() {
+    _lens_menu_widths
+    _menu_rows "${#LENS_IDS[@]}" \
+        $((LENS_MENU_W_LENS + 2 + LENS_MENU_W_GEN + 2 + LENS_MENU_W_SERIAL)) \
+        2 $((50 + ${#DETECT_LENS_AMBIGUOUS}))
+}
+
+# Lens choice. Uses LENS_IDX as the default. $1 — label of the
+# "0)" item. Prints the new index, -1 (0 in the menu) or -2 (EOF/no terminal).
+prompt_lens() {
+    local cancel_label="$1"
+    local labels=()
+    local i gen serial
+    _lens_menu_widths
+    local hdr_lens_str="$LENS_MENU_HDR_LENS"
+    local hdr_gen_str="$LENS_MENU_HDR_GEN"
+    local w_lens=$LENS_MENU_W_LENS
+    local w_gen=$LENS_MENU_W_GEN
+
+    # The table rows themselves (no "N) " prefix — prompt_choice adds it).
+    local pad_lens pad_gen
+    for ((i=0; i<${#LENS_IDS[@]}; i++)); do
+        gen="${LENS_GENERATIONS[$i]:-—}"
+        serial="${LENS_SERIALS[$i]:-—}"
+        pad_lens=$(pad "${LENS_DISPLAYS[$i]}" "$w_lens")
+        pad_gen=$(pad "$gen" "$w_gen")
+        labels+=("$pad_lens  $pad_gen  $serial")
+    done
+    local title
+    if [[ $LENS_IDX -ge 0 ]]; then
+        _t 'Choose a lens (Enter keeps the guessed one):'; title=$T
+    elif [[ -n "$DETECT_LENS_AMBIGUOUS" ]]; then
+        _tv title 'Choose a lens (ambiguous: %s):' "$DETECT_LENS_AMBIGUOUS"
+    else
+        _t 'Choose a lens:'; title=$T
+    fi
+    # Table menu header + divider under the column names (dashes).
+    local hdr_lens hdr_gen div_lens div_gen
+    hdr_lens=$(pad "$hdr_lens_str" "$w_lens")
+    hdr_gen=$(pad "$hdr_gen_str" "$w_gen")
+    # Divider: the Lens/Gen. column widths = their max; under the last
+    # column — by the length of its header.
+    local div_serial
+    printf -v div_lens   '%*s' "$w_lens" ''
+    printf -v div_gen    '%*s' "$w_gen"  ''
+    printf -v div_serial '%*s' "${#LENS_MENU_HDR_SERIAL}" ''
+    div_lens=${div_lens// /─}
+    div_gen=${div_gen// /─}
+    div_serial=${div_serial// /─}
+    prompt_choice "$title" "$LENS_IDX" "$cancel_label" \
+        "${hdr_lens}  ${hdr_gen}  ${LENS_MENU_HDR_SERIAL}" \
+        "${div_lens}  ${div_gen}  ${div_serial}" \
+        "${labels[@]}"
+}
+
+# Asks "Accept?" (commit phase). Prints to stdout one of:
+#   yes | no | quit | skip | notty (EOF/Ctrl-D or no /dev/tty; partial
+#   input before Ctrl-D is not accepted — Ctrl-D must not confirm)
+# y = commit the group's choice, n = change, q = quit everything,
+# s = skip the group.
+prompt_confirm() {
+    local input first=1
+    while true; do
+        if [[ $first -eq 1 && $CARD_STYLE -eq 1 ]]; then
+            tprintf '\n%sAccept?   %sY%s accept   %sn%s change   %ss%s skip   %sq%s quit\n\n' \
+                   "$CARD_IND" "$CS_KEY" "$CS_R" "$CS_KEY" "$CS_R" "$CS_KEY" "$CS_R" "$CS_KEY" "$CS_R" >&2
+            first=0
+        elif [[ $first -eq 1 ]]; then
+            tprintf '\nAccept?\n\n' >&2
+            tprintf '  [Y] accept         [q] quit\n' >&2
+            tprintf '  [n] change         [s] skip group\n\n' >&2
+            first=0
+        fi
+        printf '%s> ' "$CARD_IND" >&2
+        if ! IFS= read -r input 2>/dev/null </dev/tty; then
+            printf '\n' >&2
+            printf 'notty\n'; return 0
+        fi
+        case "$input" in
+            ""|y|Y|yes|Yes|YES|д|Д) printf 'yes\n';  return 0 ;;
+            n|N|no|No|NO|н|Н)       printf 'no\n';   return 0 ;;
+            q|Q|quit|Quit|выход)    printf 'quit\n'; return 0 ;;
+            s|S|skip|Skip|пропуск|П) printf 'skip\n'; return 0 ;;
+            *) tprintf '%senter Y / n / q / s\n' "$CARD_IND" >&2 ;;
+        esac
+    done
+}
+
+# Plain Y/N. Prints yes | no | notty (EOF/Ctrl-D or no /dev/tty;
+# partial input before Ctrl-D is not accepted — Ctrl-D does not apply plan).
+prompt_yes_no() {
+    local question="$1"
+    local input
+    while true; do
+        printf '\n%s [Y/n]: ' "$question" >&2
+        if ! IFS= read -r input 2>/dev/null </dev/tty; then
+            printf '\n' >&2
+            printf 'notty\n'; return 0
+        fi
+        case "$input" in
+            ""|y|Y|yes|Yes|YES|д|Д)  printf 'yes\n'; return 0 ;;
+            n|N|no|No|NO|н|Н|q|Q)    printf 'no\n';  return 0 ;;
+            *) tprintf 'enter Y / n\n' >&2 ;;
+        esac
+    done
+}
+
+# ─── Building the exiftool command ────────────────────────────────────────
+
+# Fills the global array EXIFTOOL_ARGS.
+build_exiftool_args() {
+    local cam_idx="$1" lens_idx="$2"
+
+    local lens_make="${LENS_MAKES[$lens_idx]}"
+    local lens_model="${LENS_MODELS[$lens_idx]}"
+    local lens_display="${LENS_DISPLAYS[$lens_idx]}"
+    local focal="${LENS_FOCALS[$lens_idx]}"
+    local max_ap="${LENS_MAX_APS[$lens_idx]}"
+    # min_aperture from the database (LENS_MIN_APS) is not written — see
+    # LensInfo.
+    local serial="${LENS_SERIALS[$lens_idx]}"
+    local lens_string="${LENS_STRINGS[$lens_idx]}"
+
+    local crop="${CAM_CROPS[$cam_idx]}"
+    local mn_group="${CAM_MN_GROUPS[$cam_idx]}"
+
+    local equiv
+    equiv=$(equiv_focal "$focal" "$crop")
+
+    # LensInfo per Exif 2.32: MinFocal, MaxFocal, MinFNumber@MinFocal,
+    # MinFNumber@MaxFocal — the last two are "max aperture at both ends of
+    # the zoom". For a prime both equal the max aperture; the minimum (min_ap
+    # from the database) is not written; only our database/MakerNote, if
+    # needed.
+    local info="${focal} ${focal} ${max_ap} ${max_ap}"
+
+    EXIFTOOL_ARGS=()
+    EXIFTOOL_ARGS+=("-LensMake=${lens_make}")
+    EXIFTOOL_ARGS+=("-LensModel=${lens_model}")
+    # The serial is written unconditionally: for a lens with no serial in the
+    # database the empty value clears the tag, otherwise retagging would
+    # leave the previous lens's serial behind.
+    EXIFTOOL_ARGS+=("-LensSerialNumber=${serial}")
+    # The explicit -EXIF: group is critical. Without it (just -LensInfo=...)
+    # exiftool auto-syncs the value into XMP-exifEX:LensSpecification, and our
+    # explicit -XMP-exifEX:LensInfo write below is added on top → rdf:Seq gets
+    # 8 elements instead of 4. With the group it is written only to EXIF.
+    EXIFTOOL_ARGS+=("-EXIF:LensInfo=${info}")
+    EXIFTOOL_ARGS+=("-MaxApertureValue=${max_ap}")
+    EXIFTOOL_ARGS+=("-FocalLength=${focal}")
+    EXIFTOOL_ARGS+=("-FocalLengthIn35mmFormat=${equiv}")
+    EXIFTOOL_ARGS+=("-XMP-aux:Lens=${lens_display}")
+    EXIFTOOL_ARGS+=("-XMP-aux:LensSerialNumber=${serial}")
+    # XMP-aux:SerialNumber is the BODY serial. Old glasser versions wrote
+    # the lens serial there; clear it only if it matches the old
+    # ExifIFD:LensSerialNumber (glasser always wrote them as a pair) and does
+    # not match the body serial from ExifIFD:SerialNumber. "-<" is a
+    # conditional delete, the source is read from the file BEFORE writing. If
+    # the lens serial equals the body serial (indistinguishable), the result
+    # is undef → with -m an empty string → tag untouched (non-empty ≠ '').
+    # No ExifIFD:LensSerialNumber — the same: '' and nothing is cleared.
+    # shellcheck disable=SC2016  # $_ and $self: exiftool Perl expression
+    EXIFTOOL_ARGS+=('-XMP-aux:SerialNumber-<${ExifIFD:LensSerialNumber;$_=undef if $_ eq ($self->GetValue("ExifIFD:SerialNumber") // "")}')
+    EXIFTOOL_ARGS+=("-XMP-exifEX:LensMake=${lens_make}")
+    EXIFTOOL_ARGS+=("-XMP-exifEX:LensModel=${lens_model}")
+    EXIFTOOL_ARGS+=("-XMP-exifEX:LensSerialNumber=${serial}")
+    EXIFTOOL_ARGS+=("-XMP-exifEX:LensInfo=${info}")
+
+    case "$mn_group" in
+        Nikon)
+            EXIFTOOL_ARGS+=("-Nikon:MinFocalLength=${focal}")
+            EXIFTOOL_ARGS+=("-Nikon:MaxFocalLength=${focal}")
+            EXIFTOOL_ARGS+=("-Nikon:MaxApertureAtMinFocal=${max_ap}")
+            EXIFTOOL_ARGS+=("-Nikon:MaxApertureAtMaxFocal=${max_ap}")
+            if mn_writes_nikon_lens "$cam_idx"; then
+                EXIFTOOL_ARGS+=("-Nikon:Lens=${lens_string}")
+            fi
+            ;;
+        FujiFilm)
+            EXIFTOOL_ARGS+=("-FujiFilm:MinFocalLength=${focal}")
+            EXIFTOOL_ARGS+=("-FujiFilm:MaxFocalLength=${focal}")
+            EXIFTOOL_ARGS+=("-FujiFilm:MaxApertureAtMinFocal=${max_ap}")
+            EXIFTOOL_ARGS+=("-FujiFilm:MaxApertureAtMaxFocal=${max_ap}")
+            ;;
+        "")
+            : # no MakerNote
+            ;;
+        *)
+            # Must not happen: add_camera checks the group at load time.
+            dief 'unknown MakerNote group: %s' "$mn_group"
+            ;;
+    esac
+
+    # Files are passed explicitly (as a list), so -r is not needed. -m ignores
+    # minor warnings (for NEF/RAW). largefilesupport=1 for NEF/TIFF >4GB.
+    EXIFTOOL_ARGS+=("-overwrite_original" "-m" "-api" "largefilesupport=1")
+}
+
+# Prints the exiftool command "for copy-paste" with substituted values
+# and one group's file list. If there are many files, all are listed.
+# Arguments: file paths (non-empty). Options come from EXIFTOOL_ARGS
+# (build_exiftool_args): bash 3.2 cannot return an array from a function.
+print_dry_run() {
+    printf 'exiftool \\\n'
+    local arg
+    for arg in "${EXIFTOOL_ARGS[@]}"; do
+        printf '    %s \\\n' "$(shquote "$arg")"
+    done
+    local i=0 last=$(($# - 1))
+    for arg in "$@"; do
+        if [[ $i -lt $last ]]; then
+            printf '    %s \\\n' "$(shquote "$arg")"
+        else
+            printf '    %s\n' "$(shquote "$arg")"
+        fi
+        i=$((i + 1))
+    done
+}
+
+# ─── Help ─────────────────────────────────────────────────────────────────
+
+print_help() {
+    if [[ $UI_LANG != en ]]; then
+        "_help_$UI_LANG"
+        return 0
+    fi
+    cat <<'EOF'
+glasser — rewrites lens EXIF/XMP/MakerNote tags for manual lenses on adapters.
+
+Usage:
+  glasser                       process the current folder (with subfolders)
+  glasser PATH                  process the given folder (with subfolders)
+  glasser --list-lenses         lens table
+  glasser --list-cameras        camera table
+  glasser --dry-run [PATH]      show the command, write nothing
+  glasser --no-confirm [PATH]   non-interactive (use the guesses)
+  glasser --camera ID [PATH]    force this camera
+  glasser --lens   ID [PATH]    force this lens
+  glasser --verbose [PATH]      per-file progress instead of a progress bar
+  glasser --no-art [PATH]       no splash, spinner or animation
+  glasser --version             version
+  glasser --help                this help
+
+Handles jpg, jpeg, nef, raf, tif, tiff, dng, arw, cr2, cr3.
+--camera / --lens apply to every group in the folder.
+
+Lens database: lenses.ini next to the script, one [id] section per lens,
+format described in the file header. The camera database is built into
+the script (load_camera_db).
+
+Language: English, or Russian under a Russian locale; GLASSER_LANG=en|ru
+sets it explicitly.
+EOF
+}
+
+# ─── Splash ───────────────────────────────────────────────────────────────
+# Banner above the cards (GLASSER_BANNER). On a large enough screen — a
+# drawing of a lens with a distance scale and an f/1.2–16 aperture ring,
+# else one line "◉  glasser  ·  …". The drawing only in card mode: a redraw
+# prints the banner again, and outside cards 7 extra lines in the log are
+# pointless. NO_COLOR (no-color.org) — drawing without color. --no-art (or
+# GLASSER_NO_ART=1) turns all styling off: a line instead of the drawing, no
+# scanning spinner and no "shutter click".
+
+BANNER_ROWS=3           # height of GLASSER_BANNER in screen lines
+BANNER_MIN_ROWS=30      # fewer — the drawing would take space from the menu
+BANNER_MIN_COLS=66      # drawing with margins (30) + a 35-column caption
+BANNER_ART_W=23         # inner width of the frame
+BANNER_MAX_AP=1.2       # aperture ring of the drawing: max aperture…
+BANNER_MIN_AP=16        # …and min aperture
+NO_ART=${GLASSER_NO_ART:-0}
+# Aperture frames: the scanning spinner and the "shutter click".
+APERTURE_FRAMES=("·" "○" "◎" "◉" "◎" "○")
+
+# f-number in hundredths: "2.8" → 280, "16" → 1600 (bash has no fractions).
+_fnum_x100() {
+    local i=${1%%.*} f=0
+    [[ "$1" == *.* ]] && f=${1#*.}
+    f="${f}00"
+    FNUM_X100=$(( 10#${i:-0} * 100 + 10#${f:0:2} ))
+}
+
+# Color of a digit on the aperture ring: muted tones of the 256-color
+# palette, readable on light and dark backgrounds. Max aperture: text color.
+_banner_stop_color() {
+    case "$1" in
+        2)   STOP_COLOR=167 ;; 2.8) STOP_COLOR=166 ;; 4)  STOP_COLOR=172 ;;
+        5.6) STOP_COLOR=136 ;; 8)   STOP_COLOR=30  ;; 11) STOP_COLOR=28  ;;
+        16)  STOP_COLOR=31  ;; 22)  STOP_COLOR=61  ;; 32) STOP_COLOR=96  ;;
+        *)   STOP_COLOR="" ;;
+    esac
+}
+
+# Total length of the digits in stops → len. Both variables are locals of
+# the caller _banner_aperture_row (bash dynamic scoping).
+_banner_stops_len() {
+    local k
+    len=0
+    for k in "${stops[@]}"; do len=$((len + ${#k})); done
+}
+
+# Aperture ring row exactly BANNER_ART_W columns wide: from the most closed
+# on the left to the max aperture on the right, as on a lens. $1 — max
+# aperture, $2 — min aperture, $3 — 1: colored digits. Result in BANNER_APER.
+_banner_aperture_row() {
+    local max_ap="$1" min_ap="$2" color="$3" s v mx mn i n len extra base rem used lpad rpad
+    local stops=() out="" k
+    _fnum_x100 "$max_ap"; mx=$FNUM_X100
+    _fnum_x100 "$min_ap"; mn=$FNUM_X100
+    stops=("$max_ap")
+    for s in 1.4 2 2.8 4 5.6 8 11 16 22 32; do
+        _fnum_x100 "$s"; v=$FNUM_X100
+        # 5%: f/1.9 does not sit next to 2, and f/2 is not duplicated.
+        (( v * 100 > mx * 105 && v <= mn )) && stops+=("$s")
+    done
+    # Does not fit — as on fast lenses: first drop the stop right after
+    # the max aperture (f/1.2 → "… 2 1.2"), then the most closed ones.
+    _banner_stops_len
+    if (( len + ${#stops[@]} - 1 > BANNER_ART_W && ${#stops[@]} > 2 )); then
+        stops=("${stops[0]}" "${stops[@]:2}")
+        _banner_stops_len
+    fi
+    while (( len + ${#stops[@]} - 1 > BANNER_ART_W && ${#stops[@]} > 1 )); do
+        stops=("${stops[@]:0:${#stops[@]}-1}")
+        _banner_stops_len
+    done
+    # Spaces between digits (at most 3), the rest split evenly at the edges.
+    n=${#stops[@]}
+    extra=$((BANNER_ART_W - len)); base=0; rem=0
+    if (( n > 1 )); then
+        base=$((extra / (n - 1)))
+        if (( base >= 3 )); then base=3; rem=0
+        else rem=$((extra - base * (n - 1))); fi
+        used=$((len + base * (n - 1) + rem))
+    else
+        used=$len
+    fi
+    lpad=$(((BANNER_ART_W - used) / 2)); rpad=$((BANNER_ART_W - used - lpad))
+    printf -v out '%*s' "$lpad" ''
+    for ((i = n - 1; i >= 0; i--)); do
+        STOP_COLOR=""
+        [[ "$color" == 1 ]] && _banner_stop_color "${stops[$i]}"
+        if [[ -n "$STOP_COLOR" ]]; then
+            out+=$'\033[38;5;'"${STOP_COLOR}m${stops[$i]}"$'\033[0m'
+        else
+            out+="${stops[$i]}"
+        fi
+        if (( i > 0 )); then
+            printf -v s '%*s' "$base" ''
+            out+="$s"
+            # Spread the extra spaces evenly (Bresenham).
+            k=$((n - 1 - i))
+            (( (k + 1) * rem / (n - 1) > k * rem / (n - 1) )) && out+=" "
+        fi
+    done
+    printf -v s '%*s' "$rpad" ''
+    BANNER_APER="$out$s"
+}
+
+# Spinner until the first exiftool progress line (folder walk, Perl start):
+# spins the aperture in the "Scanning…" line via stderr. Runs in background;
+# exits by itself if glasser died (kill -0 $$), so as not to write to someone
+# else's terminal. Stopped by _stop_scan_spinner.
+_scan_spinner() {
+    local i=0
+    while kill -0 $$ 2>/dev/null; do
+        tprintf '%s%s Scanning…' "$ANSI_ERASE_LINE" \
+               "${APERTURE_FRAMES[i % ${#APERTURE_FRAMES[@]}]}" >&2
+        i=$((i + 1))
+        sleep 0.12
+    done
+}
+
+# Stops the spinner (PID in SPINNER_PID) and erases its line.
+SPINNER_PID=""
+_stop_scan_spinner() {
+    [[ -n "$SPINNER_PID" ]] || return 0
+    kill "$SPINNER_PID" 2>/dev/null || true
+    wait "$SPINNER_PID" 2>/dev/null || true
+    SPINNER_PID=""
+    trap - INT
+    printf '%s' "$ANSI_ERASE_LINE" >&2
+}
+
+# "Shutter click" before "✓ Done.": the aperture closes and
+# opens (~0.3 s) in place of the check mark. Terminal only, no --no-art.
+shutter_click() {
+    local f
+    [[ -t 1 && -n "${TERM:-}" && "${TERM:-}" != "dumb" && "$NO_ART" != 1 ]] || return 0
+    for f in "◉" "◎" "○" "·" " " "·" "○" "◎" "◉"; do
+        printf '\r%s' "$f"
+        sleep 0.035
+    done
+    printf '\r'
+}
+
+# Truncates $1 to $2 characters (with "…"). Result in FIT.
+_fit() {
+    FIT="$1"
+    if (( $2 <= 0 )); then FIT=""
+    elif (( ${#1} > $2 )); then FIT="${1:0:$2-1}…"; fi
+}
+
+# Builds GLASSER_BANNER and BANNER_ROWS. $1 — folder, $2 — "N files"
+# (empty — scanning in progress), $3 — "M groups" (empty — one group).
+make_banner() {
+    local folder="$1" files="${2:-}" groups="${3:-}" info
+    local B="" D="" R="" RED="" color=1 w knurl i
+    _term_size
+    if [[ $USE_CARDS -ne 1 || "$NO_ART" == 1 ]] \
+       || (( TERM_ROWS < BANNER_MIN_ROWS || TERM_COLS < BANNER_MIN_COLS )); then
+        if [[ -z "$files" ]]; then
+            GLASSER_BANNER=$'\n◉  glasser\n\n'
+        else
+            GLASSER_BANNER=$'\n'"◉  glasser  ·  $folder  ·  $files${groups:+  ·  $groups}"$'\n\n'
+        fi
+        BANNER_ROWS=3
+        return 0
+    fi
+    if [[ -z "${NO_COLOR:-}" ]]; then
+        B=$'\033[1m'; D=$'\033[2m'; R=$'\033[0m'; RED=$'\033[38;5;160m'
+    else
+        color=0
+    fi
+    _banner_aperture_row "$BANNER_MAX_AP" "$BANNER_MIN_AP" "$color"
+    knurl=""
+    for ((i = 0; i < BANNER_ART_W - 2; i++)); do
+        if (( i % 2 )); then knurl+="▒"; else knurl+="░"; fi
+    done
+    if [[ -z "$files" ]]; then
+        _t 'scanning…'
+        info="$folder · $T"
+    else
+        info="$folder · $files${groups:+ · $groups}"
+    fi
+    w=$((TERM_COLS - 31))   # 30 — margin, frame and caption gap, 1 — edge
+    local t1 t2 t3
+    _fit "glasser" "$w";                          t1=$FIT
+    _t 'EXIF for manual lenses'
+    _fit "$T" "$w";                               t2=$FIT
+    _fit "$info" $((w - 2));                      t3=$FIT
+    GLASSER_BANNER=$'\n'
+    GLASSER_BANNER+="    ∞   5   3   2  1.5  1m"$'\n'
+    GLASSER_BANNER+="  ${D}╭─┴───┴───┴───┴───┴───┴─╮${R}   ${B}${t1}${R}"$'\n'
+    GLASSER_BANNER+="  ${D}│ ${knurl} │${R}   ${D}${t2}${R}"$'\n'
+    GLASSER_BANNER+="  ${D}│${R}${BANNER_APER}${D}│${R}   ${RED}◉${R} ${t3}"$'\n'
+    GLASSER_BANNER+="  ${D}╰───────────────────────╯${R}"$'\n\n'
+    BANNER_ROWS=7
+}
+
+# ─── Main ─────────────────────────────────────────────────────────────────
+
+EXIFTOOL_ARGS=()
+CAM_IDX=-1
+LENS_IDX=-1
+VERBOSE_PROGRESS=0
+
+# Commit-phase results (by group index):
+#   GROUP_RESULT_CAM[g]    — camera index in the database (or -1 if skip);
+#   GROUP_RESULT_LENS[g]   — lens index in the database (or -1);
+#   GROUP_RESULT_STATUS[g] — "commit" | "skip"; after writing "failed"
+#                            if exiftool returned an error on the group.
+GROUP_RESULT_CAM=()
+GROUP_RESULT_LENS=()
+GROUP_RESULT_STATUS=()
+
+main() {
+    local folder=""
+    local dry_run=0
+    local no_confirm=0
+    local forced_camera=""
+    local forced_lens=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --help|-h)         print_help; return 0 ;;
+            --version)         printf 'glasser %s\n' "$GLASSER_VERSION"; return 0 ;;
+            --list-lenses)     load_lens_db; print_lens_list; return 0 ;;
+            --list-cameras)    load_camera_db; print_camera_list; return 0 ;;
+            --dry-run)         dry_run=1; shift ;;
+            --no-confirm)      no_confirm=1; shift ;;
+            --verbose)         VERBOSE_PROGRESS=1; shift ;;
+            --no-art)          NO_ART=1; shift ;;
+            --camera)
+                [[ $# -ge 2 ]] || dief '--camera requires an ID'
+                forced_camera="$2"; shift 2 ;;
+            --lens)
+                [[ $# -ge 2 ]] || dief '--lens requires an ID'
+                forced_lens="$2"; shift 2 ;;
+            --)
+                # After "--" all are positional arguments (POSIX), with the
+                # same extra-argument check as without "--".
+                shift
+                local a
+                for a in "$@"; do
+                    [[ -z "$folder" ]] || dief 'extra argument: %s' "$a"
+                    folder="$a"
+                done
+                break
+                ;;
+            -*)
+                dief 'unknown option: %s' "$1" ;;
+            *)
+                [[ -z "$folder" ]] || dief 'extra argument: %s' "$1"
+                folder="$1"; shift ;;
+        esac
+    done
+
+    # Databases after argument parsing: --help works even without lenses.ini.
+    load_lens_db
+    load_camera_db
+
+    # Check --camera/--lens right away, before clearing the screen and
+    # scanning the folder: a typo in an id must not cost a full exiftool pass.
+    # -1 — "not set", then process_group guesses by itself.
+    local forced_cam_idx=-1 forced_lens_idx=-1
+    if [[ -n "$forced_camera" ]]; then
+        forced_cam_idx=$(index_of "$forced_camera" ${CAM_IDS[@]+"${CAM_IDS[@]}"})
+        [[ $forced_cam_idx -ge 0 ]] || dief 'camera not in the database: %s' "$forced_camera"
+    fi
+    if [[ -n "$forced_lens" ]]; then
+        forced_lens_idx=$(index_of "$forced_lens" ${LENS_IDS[@]+"${LENS_IDS[@]}"})
+        [[ $forced_lens_idx -ge 0 ]] || dief 'lens not in the database: %s' "$forced_lens"
+    fi
+
+    [[ -z "$folder" ]] && folder="$(pwd)"
+    [[ -d "$folder" ]] || dief 'not a folder: %s' "$folder"
+    # Absolute path: all scanned paths and -@ argfile lines
+    # start with '/'. Otherwise a folder "#roll" is a comment in the argfile,
+    # " lead" loses its leading space, exiftool reads "-dash" as an option.
+    # No cd: a logical cd would collapse "L/.." lexically (while the OS uses
+    # the real folder), and $(...) would strip a trailing newline.
+    # Strip trailing "/" and "/." (same place): otherwise for "d//" exiftool
+    # returns both "d//sub/x" and "d/x", and the prefix check loses files.
+    [[ "$folder" == /* ]] || folder="$PWD/$folder"
+    while :; do
+        case "$folder" in
+            */) folder="${folder%/}" ;;
+            */.) folder="${folder%/.}" ;;
+            *) break ;;
+        esac
+    done
+    [[ -n "$folder" ]] || folder="/"
+    command -v exiftool >/dev/null 2>&1 || dief 'exiftool not found in PATH'
+
+    # Interactive mode without a terminal (cron, CI, pipe) is an error, not
+    # "Cancelled" with code 0 like a deliberate q. Checked before scanning.
+    # Dry-run without --no-confirm also asks per group, so it does not
+    # matter here.
+    if [[ $no_confirm -eq 0 ]] && ! { : </dev/tty; } 2>/dev/null; then
+        dief 'no terminal — use --no-confirm'
+    fi
+
+    # One trial CSI 6n — in this shell, not in a card's $(...): if the
+    # terminal does not answer (Emacs shell, script/expect, CI pty), cards
+    # are turned off entirely — no clear, no queries and no one-second
+    # timeouts on every redraw.
+    if [[ $USE_CARDS -eq 1 ]]; then
+        get_cursor_row
+        [[ $CURSOR_ROW -gt 0 ]] || USE_CARDS=0
+    fi
+    _card_style_init
+
+    # Soft clear of the visible area before starting (TTY only).
+    # Without it, earlier bash/zsh output pushes our "top of card"
+    # above the visible area on the first scroll, and cursor-up can no longer
+    # get back there → in-place redraw breaks.
+    # `\033[H\033[2J` clears the visible part and moves the cursor to (1,1).
+    # Scroll-back is KEPT (this is not `\033[3J`) — the user can
+    # scroll up and see earlier commands.
+    if [[ $USE_CARDS -eq 1 ]]; then
+        printf '%s' "$ANSI_CLEAR_SCREEN"
+    fi
+
+    # Save the top of the scan phase via CSI 6n. When scanning
+    # finishes, erase everything from this position and replace it with the
+    # full banner (with the folder and file count).
+    local scan_top_row=0
+    if [[ $USE_CARDS -eq 1 ]]; then
+        get_cursor_row
+        scan_top_row=$CURSOR_ROW
+        # Banner during scanning — shows that glasser is working.
+        make_banner "$(basename "$folder")"
+        printf '%s' "$GLASSER_BANNER"
+    fi
+
+    # Step 1: one batch command reads the EXIF of all files and groups them.
+    scan_and_group "$folder"
+
+    local total=${#FILES_PATH[@]}
+    local groups=${#GROUP_SIG[@]}
+    if [[ $total -eq 0 ]]; then
+        # Everything found was filtered out — without a reason, "no images" is
+        # confusing (the skip warning below never gets here).
+        if [[ $SCAN_SKIPPED -gt 0 ]]; then
+            dief 'no readable images in the folder: %d %s skipped — control characters (newline, TAB) in a file or folder name, or exiftool could not read the file: %s' \
+                 "$SCAN_SKIPPED" "$(files_word "$SCAN_SKIPPED")" "$folder"
+        fi
+        dief 'no images in the folder: %s' "$folder"
+    fi
+
+    # In card mode the banner below would erase the preview table at once, so
+    # it is not printed at all (it would only clutter scroll-back). Print it
+    # when there will be no banner: non-TTY or CSI 6n gave no position.
+    local replace_scan=0
+    if [[ $USE_CARDS -eq 1 && $scan_top_row -gt 0 ]]; then
+        replace_scan=1
+    fi
+    if [[ $replace_scan -eq 0 ]]; then
+        tprintf 'Analyzing: %s\n' "$folder"
+        if [[ $groups -eq 1 ]]; then
+            tprintf 'Files: %d\n' "$total"
+        else
+            tprintf 'Files: %d, groups: %d\n\n' "$total" "$groups"
+            group_table_widths preview
+            group_table_header preview
+            local g
+            for ((g=0; g<groups; g++)); do
+                format_group_line "$g" preview
+            done
+        fi
+    fi
+
+    # In a TTY: replace the whole scan phase with the banner (splash or line
+    # "◉ glasser · <folder> · N files [· M groups]", see make_banner).
+    # Save the banner — _card_redraw_screen reprints it.
+    if [[ $replace_scan -eq 1 ]]; then
+        _restore_and_erase "$scan_top_row"
+        local groups_str=""
+        [[ $groups -eq 1 ]] || groups_str="$groups $(groups_word "$groups")"
+        make_banner "$(basename "$folder")" \
+                    "$total $(files_word "$total")" "$groups_str"
+        printf '%s' "$GLASSER_BANNER"
+    fi
+    # After the banner: in a TTY everything printed during scanning is erased.
+    if [[ $SCAN_SKIPPED -gt 0 ]]; then
+        tprintf 'warning: %d %s skipped — control characters (newline, TAB) in a file or folder name, or exiftool could not read the file\n' \
+               "$SCAN_SKIPPED" "$(files_word "$SCAN_SKIPPED")" >&2
+    fi
+
+    # Step 2: commit phase. Walk the groups; for each one the user
+    # confirms the choice (or skips). NO writing happens here.
+    local g
+    for ((g=0; g<groups; g++)); do
+        local rc=0
+        process_group "$g" "$groups" "$no_confirm" \
+                      "$forced_cam_idx" "$forced_lens_idx" || rc=$?
+        case "$rc" in
+            0)
+                GROUP_RESULT_STATUS+=("commit")
+                GROUP_RESULT_CAM+=("$CAM_IDX")
+                GROUP_RESULT_LENS+=("$LENS_IDX")
+                ;;
+            2)
+                GROUP_RESULT_STATUS+=("skip")
+                GROUP_RESULT_CAM+=("-1")
+                GROUP_RESULT_LENS+=("-1")
+                ;;
+            3)
+                tprintf '\nCancelled. Nothing written.\n'
+                return 0
+                ;;
+            4)
+                _tty_lost_err
+                return 1
+                ;;
+            *)
+                # Validation error in no-confirm mode.
+                return 1
+                ;;
+        esac
+    done
+
+    # Step 3: apply phase. Summary plan + final confirmation, then the write.
+    apply_plan "$dry_run" "$no_confirm"
+}
+
+# Processes one group in the commit phase. Returns:
+#   0 — choice confirmed;
+#   1 — validation error (no-confirm);
+#   2 — skipped (s, or "0" in the menu when there is nowhere to go back);
+#   3 — quit (q);
+#   4 — EOF (Ctrl-D) or no terminal: reading /dev/tty failed
+#       in the middle of interaction.
+# Arguments $4/$5 — --camera/--lens indices (main checked them in advance),
+# -1 — not set, guess.
+# Fills globals CAM_IDX, LENS_IDX (the caller saves them to RESULT arrays).
+process_group() {
+    local g="$1" total_groups="$2" no_confirm="$3"
+    local forced_cam_idx="$4" forced_lens_idx="$5"
+    local sig_make sig_model sig_lensmodel sig_focal sig_maxap
+    IFS=$SEP read -r sig_make sig_model sig_lensmodel sig_focal sig_maxap \
+        <<<"${GROUP_SIG[$g]}"
+
+    # Detect once (does not change during the card — until the user
+    # re-picks via the menu). Data comes from the scan (the group's first
+    # file), without running exiftool again.
+    if [[ $forced_cam_idx -ge 0 ]]; then
+        CAM_IDX=$forced_cam_idx
+    else
+        CAM_IDX=$(detect_camera "$sig_make" "$sig_model")
+    fi
+    if [[ $forced_lens_idx -ge 0 ]]; then
+        LENS_IDX=$forced_lens_idx
+        DETECT_LENS_AMBIGUOUS=""
+    else
+        detect_lens "$sig_focal" "$sig_maxap" "$sig_lensmodel" \
+                    "${GROUP_LENSMAKE[$g]}" "${GROUP_LENSINFO[$g]}"
+        LENS_IDX=$DETECT_LENS_IDX
+    fi
+
+    # ── no-confirm path: no prompts. The card is printed in full and
+    # collapses into a log line (in a TTY it is erased, outside a TTY it stays
+    # above it); on an error it stays as is. ──
+    if [[ $no_confirm -eq 1 ]]; then
+        # Episode: blank + 2 summary lines (+ generation and serial in
+        # CARD_STYLE) + an error line.
+        card_start_with_group_header "$g" "$total_groups" $((4 + CARD_STYLE))
+        printf '\n'
+        print_summary "guessed"
+        if [[ $CAM_IDX -lt 0 ]]; then
+            errf 'group %d/%d: camera not detected (need --camera ID)' $((g+1)) "$total_groups"
+            return 1
+        fi
+        if [[ $LENS_IDX -lt 0 && -n "$DETECT_LENS_AMBIGUOUS" ]]; then
+            errf 'group %d/%d: lens is ambiguous: %s — need --lens ID' $((g+1)) "$total_groups" "$DETECT_LENS_AMBIGUOUS"
+            return 1
+        fi
+        if [[ $LENS_IDX -lt 0 ]]; then
+            errf 'group %d/%d: lens not guessed (need --lens ID)' $((g+1)) "$total_groups"
+            return 1
+        fi
+        _collapse_committed "$g" "$total_groups"
+        return 0
+    fi
+
+    # ── Interactive path: anchor header + changing sub-episodes. ──
+    card_start_with_group_header "$g" "$total_groups"
+
+    local first_iteration=1
+    local prev_cam prev_lens new_cam new_lens
+    while true; do
+        # Episode: summary + prompt. The tag preview moved to the plan view.
+        # Redraw the header on every pass except the first.
+        if [[ $first_iteration -eq 0 ]]; then
+            card_reset_to_header "$SUMMARY_EPISODE_ROWS"
+        fi
+        local mode="guessed"
+        [[ $first_iteration -eq 0 ]] && mode="chosen"
+
+        if [[ $CAM_IDX -ge 0 && $LENS_IDX -ge 0 ]]; then
+            printf '\n'
+            print_summary "$mode"
+            local ans
+            ans=$(prompt_confirm)
+            case "$ans" in
+                yes)
+                    _collapse_committed "$g" "$total_groups"
+                    return 0
+                    ;;
+                quit)
+                    return 3
+                    ;;
+                skip)
+                    _collapse_skipped "$g" "$total_groups"
+                    return 2
+                    ;;
+                notty)
+                    return 4
+                    ;;
+                no)   ;;
+            esac
+        fi
+
+        # "0" in the menu: if there was a full choice before the menu — back
+        # to "Accept?" with it; otherwise there is nowhere to return (with no
+        # prompt the menu would reopen) — skip the group. Only q quits
+        # everything.
+        prev_cam=$CAM_IDX
+        prev_lens=$LENS_IDX
+        local cancel_label
+        _t 'Skip group'; cancel_label=$T
+        if [[ $prev_cam -ge 0 && $prev_lens -ge 0 ]]; then
+            _t 'Back'; cancel_label=$T
+        fi
+
+        # Episode: camera menu. Erases the previous episode (prompt).
+        # A failed substitution or a non-number exits, not a silent index 0.
+        _camera_menu_rows
+        card_reset_to_header "$MENU_ROWS"
+        new_cam=$(prompt_camera "$cancel_label") || return 3
+        [[ $new_cam =~ ^-?[0-9]+$ ]] || return 3
+        if [[ $new_cam -ge 0 ]]; then
+            CAM_IDX=$new_cam
+            # Episode: lens menu. Erases the camera menu.
+            _lens_menu_rows
+            card_reset_to_header "$MENU_ROWS"
+            new_lens=$(prompt_lens "$cancel_label") || return 3
+            [[ $new_lens =~ ^-?[0-9]+$ ]] || return 3
+        else
+            new_lens=$new_cam
+        fi
+        case "$new_lens" in
+            -2) return 4 ;;
+            -1)
+                if [[ $prev_cam -ge 0 && $prev_lens -ge 0 ]]; then
+                    CAM_IDX=$prev_cam
+                    LENS_IDX=$prev_lens
+                    card_reset_to_header
+                    continue
+                fi
+                _collapse_skipped "$g" "$total_groups"
+                return 2
+                ;;
+        esac
+        LENS_IDX=$new_lens
+
+        first_iteration=0
+    done
+}
+
+# Collapses the card into one line "<mark> Group N/M: <body> (K files)".
+# The "Group N/M: " prefix only with several groups.
+# Arguments: g, total_groups, mark, body.
+_collapse_group_line() {
+    local g="$1" total_groups="$2" mark="$3" body="$4"
+    local count="${GROUP_COUNT[$g]}"
+    local word prefix=""
+    word=$(files_word "$count")
+    if [[ $total_groups -gt 1 ]]; then
+        _tv prefix 'Group %d/%d: ' $((g+1)) "$total_groups"
+    fi
+    card_collapse "${mark} ${prefix}${body} (${count} ${word})"
+}
+
+# "✓ Group N/M: cam + lens (K files)" for the current CAM_IDX/LENS_IDX.
+_collapse_committed() {
+    _collapse_group_line "$1" "$2" "✓" \
+        "${CAM_DISPLAYS[$CAM_IDX]} + ${LENS_DISPLAYS[$LENS_IDX]}"
+}
+
+# "⤳ Group N/M: skipped (K files)".
+_collapse_skipped() {
+    _t 'skipped'
+    _collapse_group_line "$1" "$2" "⤳" "$T"
+}
+
+# Apply phase: the orchestrator. Computes aggregates, shows the plan, asks
+# for confirmation, runs the write, prints the final summary.
+apply_plan() {
+    local dry_run="$1" no_confirm="$2"
+
+    local commits commit_files skip_files
+    read -r commits commit_files skip_files < <(plan_count_commits)
+
+    if [[ $commits -eq 0 ]]; then
+        tprintf '\nNothing to apply: all groups skipped.\n'
+        return 0
+    fi
+
+    print_plan_block
+
+    # Final confirmation (only in live interaction, not in dry-run).
+    if [[ $no_confirm -eq 0 && $dry_run -eq 0 ]]; then
+        local ans
+        _t 'Apply the plan?'
+        ans=$(prompt_yes_no "$T")
+        if [[ "$ans" == "notty" ]]; then
+            _tty_lost_err
+            return 1
+        fi
+        if [[ "$ans" != "yes" ]]; then
+            tprintf '\nCancelled. Nothing written.\n'
+            return 0
+        fi
+    fi
+
+    execute_plan "$dry_run"
+
+    if [[ $dry_run -eq 0 ]]; then
+        print_final_summary "$commit_files" "$skip_files"
+    fi
+    if [[ -n "$EXEC_FAILED_GROUPS" ]]; then
+        errf 'exiftool failed in groups: %s; the other groups were processed' "$EXEC_FAILED_GROUPS"
+        return 1
+    fi
+}
+
+# Prints "commits commit_files skip_files" on one line.
+plan_count_commits() {
+    local g commits=0 commit_files=0 skip_files=0
+    local groups=${#GROUP_SIG[@]}
+    for ((g=0; g<groups; g++)); do
+        if [[ "${GROUP_RESULT_STATUS[$g]}" == "commit" ]]; then
+            commits=$((commits + 1))
+            commit_files=$((commit_files + GROUP_COUNT[g]))
+        else
+            skip_files=$((skip_files + GROUP_COUNT[g]))
+        fi
+    done
+    printf '%d %d %d\n' "$commits" "$commit_files" "$skip_files"
+}
+
+# Prints the summary "Write plan".
+print_plan_block() {
+    local groups=${#GROUP_SIG[@]} g
+    tprintf '\n━━━ Write plan ━━━\n'
+    group_table_widths plan
+    group_table_header plan
+    for ((g=0; g<groups; g++)); do
+        format_group_line "$g" plan
+    done
+
+    # Tag preview for every committed group — details of the values that
+    # will actually land in EXIF. It used to be shown inside the card, but
+    # the card was slimmed down for reliable in-place redraw → details here.
+    for ((g=0; g<groups; g++)); do
+        if [[ "${GROUP_RESULT_STATUS[$g]}" == "commit" ]]; then
+            local cam_idx=${GROUP_RESULT_CAM[$g]}
+            local lens_idx=${GROUP_RESULT_LENS[$g]}
+            if [[ $groups -gt 1 ]]; then
+                printf '\n[%d] %s + %s\n' $((g+1)) \
+                       "${CAM_DISPLAYS[$cam_idx]}" "${LENS_DISPLAYS[$lens_idx]}"
+            fi
+            _print_tag_preview_for "$cam_idx" "$lens_idx"
+        fi
+    done
+}
+
+# Draws one progress bar line "<prefix>[███░░] NN% (cur/total) fname"
+# over the current one (ANSI_ERASE_LINE). Arguments: prefix, cur, total, file
+# name, window width (0 — unknown, no truncation). Bar width —
+# PROGRESS_BAR_WIDTH.
+# The line must stay strictly narrower than the window: EL 2 + CR erase only
+# the current physical line, and a wrapped bar would leave a tail on screen
+# on every update. So a long name is truncated with "…", and in a
+# narrow window the bar itself shrinks too (down to 10 cells).
+_draw_progress() {
+    local prefix="$1" cur="$2" total="$3" fname="$4" cols="$5"
+    local bar_w=$PROGRESS_BAR_WIDTH
+    local fixed avail pct filled empty fstr estr
+    if (( cols > 0 )); then
+        # prefix + "[" bar "] " + "NNN%" + " (cur/total) "
+        fixed=$(( ${#prefix} + 1 + bar_w + 2 + 4 + 2 + ${#cur} + 1 + ${#total} + 2 ))
+        avail=$((cols - 1 - fixed))
+        if (( avail < 8 && bar_w > 10 )); then
+            bar_w=$((bar_w - (8 - avail)))
+            if (( bar_w < 10 )); then bar_w=10; fi
+            fixed=$(( ${#prefix} + 1 + bar_w + 2 + 4 + 2 + ${#cur} + 1 + ${#total} + 2 ))
+            avail=$((cols - 1 - fixed))
+        fi
+        if (( avail < 2 )); then
+            fname=""
+        elif (( ${#fname} > avail )); then
+            fname="${fname:0:avail-1}…"
+        fi
+    fi
+    pct=$((cur * 100 / total))
+    filled=$((cur * bar_w / total))
+    empty=$((bar_w - filled))
+    # bash 3.2-compatible fill via printf -v and substitution.
+    printf -v fstr '%*s' "$filled" ''
+    printf -v estr '%*s' "$empty" ''
+    fstr=${fstr// /█}
+    estr=${estr// /░}
+    printf '%s%s[%s%s] %3d%% (%d/%d) %s' \
+           "$ANSI_ERASE_LINE" "$prefix" "$fstr" "$estr" "$pct" "$cur" "$total" "$fname"
+}
+
+# Runs exiftool with -progress and draws a single updating progress bar
+# line (\r overprint). The serial output "======== file [N/M]"
+# goes to exiftool's stdout — we parse and rewrite it.
+#
+# Non-progress exiftool lines (warnings, the final "N image files updated")
+# are printed on a separate line without breaking the next step's bar.
+#
+# The original exiftool rc is returned via PIPESTATUS.
+run_with_progress_bar() {
+    # Arguments: everything goes to exiftool as is.
+    local rc
+    # Window width — once before the run (for truncating the bar line).
+    _term_size
+    local cols=$TERM_COLS
+
+    exiftool -progress -q "$@" 2>&1 | {
+        local cur=0 total=0 fname="" last_path=""
+        while IFS= read -r line; do
+            if [[ "$line" =~ ^========\ (.+)\ \[([0-9]+)/([0-9]+)\]$ ]]; then
+                last_path="${BASH_REMATCH[1]}"
+                fname=$(basename "$last_path")
+                cur=${BASH_REMATCH[2]}
+                total=${BASH_REMATCH[3]}
+                _draw_progress "" "$cur" "$total" "$fname" "$cols"
+            elif [[ -n "$line" ]]; then
+                # A non-progress line (warning/error from exiftool or Perl).
+                # Prefix it with the last file name from a progress event,
+                # so it is visible which file has the problem — exiftool
+                # does not print the path in warnings itself.
+                if [[ -n "$fname" ]]; then
+                    printf '%s[%s] %s\n' "$ANSI_ERASE_LINE" "$fname" "$line"
+                else
+                    printf '%s%s\n' "$ANSI_ERASE_LINE" "$line"
+                fi
+                # Append the path to the shared tmp list (dedup later, in
+                # the parent via sort -u). A pipe subshell does not see the
+                # parent's array changes — hence a file, not a variable.
+                if [[ -n "$last_path" && -n "$WARNED_FILES_TMP" ]]; then
+                    printf '%s\n' "$last_path" >> "$WARNED_FILES_TMP"
+                fi
+            fi
+        done
+        # Final newline after the last bar.
+        printf '\n'
+    }
+    rc=${PIPESTATUS[0]}
+    return "$rc"
+}
+
+# For each file with warnings, extracts the structural warnings
+# via `exiftool -Warning -G1 -s` — the special Warning tag into
+# which exiftool writes metadata parsing problems (Bad MakerNote,
+# Invalid IFD entry, etc). If the tag is empty, the warning arose not while
+# reading but during the write (inside exiftool); we give a hint for that.
+print_warning_postmortem() {
+    if [[ $# -eq 0 ]]; then
+        return 0
+    fi
+    tprintf '\nWarning details:\n'
+    local f w
+    for f in "$@"; do
+        # `-Warning -G1 -s` — only the Warning tag (no -all: that dumps
+        # every tag).
+        w=$(exiftool -Warning -G1 -s "$f" 2>/dev/null)
+        if [[ -n "$w" ]]; then
+            printf '  %s:\n' "$(basename "$f")"
+            printf '%s\n' "$w" | sed 's/^/    /'
+        else
+            tprintf '  %s: no structural warnings in the file\n' \
+                   "$(basename "$f")"
+            # shellcheck disable=SC2016
+            tprintf '    (exiftool warned while writing; the file was updated.\n'
+            # shellcheck disable=SC2016
+            tprintf '    Details: `exiftool -v "%s" 2>&1 | grep -B 3 -i warning`)\n' "$f"
+        fi
+    done
+}
+
+# Group numbers (1-based, joined by ", ") on which exiftool returned an error.
+# Filled by execute_plan; such groups get GROUP_RESULT_STATUS=failed.
+EXEC_FAILED_GROUPS=""
+
+# Run over the groups: either exiftool or printing the command (dry-run).
+# An exiftool error in one group does not stop the others: the group
+# is marked failed and the run goes on (exiftool also continues within a
+# group after a failed file). The error code is set by apply_plan.
+# Changes the globals EXIFTOOL_ARGS, FILES_OF_GROUP, GROUP_RESULT_STATUS,
+# EXEC_FAILED_GROUPS.
+execute_plan() {
+    local dry_run="$1"
+    local groups=${#GROUP_SIG[@]} g
+    EXEC_FAILED_GROUPS=""
+
+    # Tmp file to which run_with_progress_bar appends problem paths.
+    # Dedup via sort -u at the very end. A template with a path, not `-t`: BSD
+    # mktemp -t keeps the X's in the name literally, GNU reads -t differently.
+    trap _cleanup_tmp EXIT
+    WARNED_FILES_TMP=$(mktemp "${TMPDIR:-/tmp}/glasser-warned.XXXXXX")
+
+    # Ctrl-C during the write: exiftool catches SIGINT itself and exits with
+    # code 1, so bash does not die and would go on writing the next groups.
+    # Catch INT and stop after the current exiftool (the trap fires once
+    # the foreground process has finished; children get the tty SIGINT
+    # anyway). No trap in dry-run: there is nothing to write, and Ctrl-C must
+    # kill the run at once (with a trap printing would go on with code 0, and
+    # a killed $(shquote …) would leave an empty path).
+    local interrupted=0
+    [[ $dry_run -eq 1 ]] || trap 'interrupted=1' INT
+
+    for ((g=0; g<groups; g++)); do
+        [[ "${GROUP_RESULT_STATUS[$g]}" == "commit" ]] || continue
+        local cam=${GROUP_RESULT_CAM[$g]} lens=${GROUP_RESULT_LENS[$g]}
+        build_exiftool_args "$cam" "$lens"
+        files_of_group "$g"
+        # Ctrl-C between groups (also mid build_exiftool_args: a killed
+        # $(equiv_focal …) would give an empty value and clear the tag) —
+        # the next exiftool is not started.
+        if [[ $interrupted -eq 1 ]]; then
+            printf '\n' >&2
+            errf 'interrupted (Ctrl-C) before group %d: it and the following ones are untouched' $((g+1))
+            exit 130
+        fi
+
+        if [[ $dry_run -eq 1 ]]; then
+            if [[ $groups -gt 1 ]]; then
+                tprintf '\n# Group %d/%d (%s + %s):\n' \
+                       $((g+1)) "$groups" \
+                       "${CAM_DISPLAYS[$cam]}" "${LENS_DISPLAYS[$lens]}"
+            else
+                tprintf '\n--- dry-run, the command is not executed: ---\n'
+            fi
+            print_dry_run "${FILES_OF_GROUP[@]}"
+            continue
+        fi
+
+        if [[ $groups -gt 1 ]]; then
+            tprintf '\nRunning exiftool for group %d/%d...\n' $((g+1)) "$groups"
+        else
+            tprintf '\nRunning exiftool...\n'
+        fi
+
+        # Path list via `-@ argfile` — works around ARG_MAX.
+        # Progress: by default draw the bar (a single updating line).
+        # With --verbose or in non-TTY — serial "======== file [N/M]".
+        # Safety net for -@: a line not starting with '/', or a path with a
+        # newline would become a comment or an option in the argfile.
+        # scan_and_group lets nothing like that through — an invariant check.
+        local f
+        for f in "${FILES_OF_GROUP[@]}"; do
+            case "$f" in
+                /*$'\n'*|/*$'\r'*) dief 'path with a newline: %s' "$f" ;;
+                /*) ;;
+                *) dief 'path is not absolute: %s' "$f" ;;
+            esac
+        done
+        ARGFILE=$(mktemp "${TMPDIR:-/tmp}/glasser-files.XXXXXX")
+        printf '%s\n' "${FILES_OF_GROUP[@]}" > "$ARGFILE"
+        local rc=0
+        # The bar only where cards work (TTY, not TERM=dumb, the terminal
+        # answers): otherwise ANSI line erasing would leak into the output.
+        if [[ $VERBOSE_PROGRESS -eq 1 || $USE_CARDS -eq 0 ]]; then
+            exiftool -progress "${EXIFTOOL_ARGS[@]}" -@ "$ARGFILE" || rc=$?
+        else
+            run_with_progress_bar "${EXIFTOOL_ARGS[@]}" -@ "$ARGFILE" || rc=$?
+        fi
+        rm -f "$ARGFILE"
+        ARGFILE=""
+        if [[ $interrupted -eq 1 ]]; then
+            # A newline so the message does not land on a half-drawn bar.
+            printf '\n' >&2
+            errf 'interrupted (Ctrl-C) in group %d: it may be partly written, the following ones are untouched' $((g+1))
+            exit 130
+        fi
+        if [[ $rc -ne 0 ]]; then
+            GROUP_RESULT_STATUS[g]="failed"
+            EXEC_FAILED_GROUPS="${EXEC_FAILED_GROUPS:+$EXEC_FAILED_GROUPS, }$((g+1))"
+            errf 'exiftool failed (group %d)' $((g+1))
+        fi
+    done
+    trap - INT
+
+    # Post-mortem: unique paths from the tmp file. If there were no warnings,
+    # the file is empty and print_warning_postmortem gets 0 arguments.
+    local warned=()
+    if [[ -s "$WARNED_FILES_TMP" ]]; then
+        local f
+        while IFS= read -r f; do
+            warned+=("$f")
+        done < <(sort -u "$WARNED_FILES_TMP")
+    fi
+    rm -f "$WARNED_FILES_TMP"
+    WARNED_FILES_TMP=""
+    if [[ ${#warned[@]} -gt 0 ]]; then
+        print_warning_postmortem "${warned[@]}"
+    fi
+}
+
+# Final summary after the write. Groups with an exiftool error (failed)
+# are shown separately: some of their files may have been written — exiftool
+# writes file by file.
+print_final_summary() {
+    local commit_files="$1" skip_files="$2"
+    local groups=${#GROUP_SIG[@]} g
+    local failed_files=0
+    for ((g=0; g<groups; g++)); do
+        if [[ "${GROUP_RESULT_STATUS[$g]}" == "failed" ]]; then
+            failed_files=$((failed_files + GROUP_COUNT[g]))
+        fi
+    done
+    local ok_files=$((commit_files - failed_files))
+
+    if [[ $failed_files -eq 0 ]]; then
+        printf '\n'
+        shutter_click
+        tprintf '✓ Done.\n'
+    else
+        tprintf '\n✗ Done with errors.\n'
+    fi
+    if [[ $groups -gt 1 ]]; then
+        group_table_widths final
+        group_table_header final
+        for ((g=0; g<groups; g++)); do
+            format_group_line "$g" final
+        done
+        tprintf '\nTotal: %d %s tagged' "$ok_files" "$(files_word "$ok_files")"
+        if [[ $failed_files -gt 0 ]]; then
+            tprintf ', %d %s failed (some may be partly written)' \
+                   "$failed_files" "$(files_word "$failed_files")"
+        fi
+        if [[ $skip_files -gt 0 ]]; then
+            tprintf ', %d %s skipped' "$skip_files" "$(files_word "$skip_files")"
+        fi
+        printf '.\n\n'
+    else
+        local cam=${GROUP_RESULT_CAM[0]}
+        local lens=${GROUP_RESULT_LENS[0]}
+        local key_w k_done k_failed k_cam k_lens
+        _t 'Tagged:'; k_done=$T
+        _t 'Failed:'; k_failed=$T
+        _t 'Camera:'; k_cam=$T
+        _t 'Lens:';   k_lens=$T
+        _max_len "$k_done" "$k_failed" "$k_cam" "$k_lens"
+        key_w=$MAX_LEN
+        if [[ $failed_files -eq 0 ]]; then
+            printf '  %s %d %s\n' "$(pad "$k_done" "$key_w")" \
+                   "$commit_files" "$(files_word "$commit_files")"
+        else
+            tprintf '  %s %d %s (some may be partly written)\n' \
+                   "$(pad "$k_failed" "$key_w")" \
+                   "$failed_files" "$(files_word "$failed_files")"
+        fi
+        printf '  %s %s\n'    "$(pad "$k_cam" "$key_w")" "${CAM_DISPLAYS[$cam]}"
+        printf '  %s %s\n'    "$(pad "$k_lens" "$key_w")" "${LENS_DISPLAYS[$lens]}"
+    fi
+}
+
+main "$@"

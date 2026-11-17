@@ -1,0 +1,14 @@
+# macOS
+.DS_Store
+
+# Editor / tool scratch
+*.bak
+
+# Claude Code workspace state
+.claude/
+
+# Sample images (kept locally for tests, not tracked)
+samples/
+
+# Personal lens database (template: lenses.example.ini)
+/lenses.ini
